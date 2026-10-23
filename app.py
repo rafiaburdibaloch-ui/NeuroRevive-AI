@@ -1,513 +1,496 @@
-"""NeuroRevive AI - Streamlit app. Wellness practice prototype, NOT a diagnostic tool."""
+"""NeuroRevive AI - Streamlit entry point."""
+from __future__ import annotations
+
 import os
-import random
 import re
-import time
 import uuid
-from pathlib import Path
+from datetime import datetime, time as dtime, timezone
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-import core
+import db
+import games
+import llm
+import logic
 
 st.set_page_config(page_title="NeuroRevive AI", page_icon="🧠", layout="wide")
-core.init_db()
-st.markdown(f"<style>{Path(__file__).with_name('styles.css').read_text()}</style>",
-            unsafe_allow_html=True)
 
+PID_RE = re.compile(r"^[A-Za-z0-9_-]{3,24}$")
 PAGES = ["Dashboard", "Memory Matrix", "Focus Finder", "Reaction Rush", "Analysis",
          "Training Plan", "Progress", "Reminders", "About"]
-PID_RE = re.compile(r"[A-Za-z0-9_-]{3,30}")
-COLORS = {"Memory Matrix": "#a78bfa", "Focus Finder": "#22d3ee", "Reaction Rush": "#818cf8"}
-DISCLAIMER = ("⚠️ Wellness practice prototype. It does not diagnose, screen or treat any condition, "
-              "and it does not measure intelligence or brain health.")
+TASK_PAGE = {"memory": "Memory Matrix", "focus": "Focus Finder", "reaction": "Reaction Rush"}
+PALETTE = ["#8B5CF6", "#22D3EE", "#6366F1", "#F472B6"]
 
-S = st.session_state
-S.setdefault("page", "Dashboard")
-S.setdefault("pid", "guest-" + uuid.uuid4().hex[:6])
+CSS = """
+:root{--card:#111B3A;--border:#26325F;--cyan:#22D3EE;--muted:#9AA6D1;}
+[data-testid="stAppViewContainer"]{background:radial-gradient(1200px 600px at 10% -10%,#1B2559 0%,#0A1030 55%,#070B22 100%);}
+[data-testid="stHeader"]{background:transparent;}
+[data-testid="stSidebar"]{background:#0B1233;border-right:1px solid var(--border);}
+h1,h2,h3{letter-spacing:-0.02em;}
+.nr-hero{background:linear-gradient(135deg,rgba(99,102,241,.25),rgba(34,211,238,.12));border:1px solid var(--border);
+  border-radius:20px;padding:1.6rem 1.8rem;margin-bottom:1rem;}
+.nr-hero h1{margin:.4rem 0 .3rem;font-size:2.3rem;
+  background:linear-gradient(90deg,#C4B5FD,#67E8F9);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.nr-hero p{color:var(--muted);margin:0;max-width:760px;}
+.nr-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:1rem 1.25rem;margin-bottom:.8rem;}
+.nr-card h3{margin-top:.4rem;}
+.nr-pill{display:inline-block;padding:.12rem .65rem;border-radius:999px;font-size:.75rem;color:var(--cyan);
+  border:1px solid var(--border);background:rgba(34,211,238,.08);}
+.nr-pill.warn{color:#FBBF24;background:rgba(251,191,36,.08);}
+[data-testid="stMetric"]{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:.8rem 1rem;}
+.stButton>button,.stDownloadButton>button{border-radius:12px;}
+.stButton>button[kind="primary"]{background:linear-gradient(90deg,#6366F1,#8B5CF6);border:none;color:white;}
+:focus-visible{outline:3px solid #22D3EE !important;outline-offset:2px;}
+.nr-grid{display:grid;gap:8px;max-width:420px;margin:.5rem 0 1rem;}
+.nr-cell{aspect-ratio:1/1;border-radius:10px;background:#141E45;border:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;font-weight:700;font-size:1.2rem;}
+.nr-cell.on{background:linear-gradient(135deg,#22D3EE,#6366F1);border-color:#22D3EE;}
+.nr-cell.hit{background:#065F46;border-color:#34D399;}
+.nr-cell.miss{background:#78350F;border-color:#FBBF24;}
+.nr-cell.fp{background:#7F1D1D;border-color:#F87171;}
+.rr-box{height:180px;border-radius:18px;display:flex;align-items:center;justify-content:center;
+  font-size:1.6rem;font-weight:700;margin-bottom:.6rem;}
+.rr-wait{background:#78350F;color:#FDE68A;border:2px solid #FBBF24;}
+.rr-go{background:#065F46;color:#D1FAE5;border:2px solid #34D399;}
+"""
 
-
-def go(page):
-    S.page = page
-
-
-def fmt(v, suffix=""):
-    return "—" if v is None or pd.isna(v) else f"{v:.0f}{suffix}"
-
-
-def hero(title, sub):
-    st.markdown(f"<div class='hero'><h1>{title}</h1><p>{sub}</p></div>", unsafe_allow_html=True)
-
-
-def card(title, body, badge=None):
-    b = f"<span class='badge violet'>{badge}</span>" if badge else ""
-    st.markdown(f"<div class='card'><h4>{b}{title}</h4><p>{body}</p></div>", unsafe_allow_html=True)
-
-
-def disclaimer():
-    st.markdown(f"<div class='disclaimer'>{DISCLAIMER}</div>", unsafe_allow_html=True)
-
-
-def line_chart(df, y, title, ytitle):
-    d = df.dropna(subset=[y])
-    if d.empty:
-        return
-    fig = px.line(d, x="created", y=y, color="task_name", markers=True, title=title,
-                  color_discrete_map=COLORS, template="plotly_dark")
-    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      legend_title_text="", yaxis_title=ytitle, xaxis_title=None, height=340)
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def get_keys():
-    """API keys live in Streamlit Secrets or environment variables, never in the code."""
-    keys = {}
-    for name in ("GEMINI_API_KEY", "GROQ_API_KEY"):
-        try:
-            keys[name] = st.secrets[name]
-        except Exception:
-            keys[name] = os.getenv(name)
-    return {k: v for k, v in keys.items() if v}
+DISCLAIMER = ("NeuroRevive AI is a **prototype for cognitive task practice and self-monitoring**. It does not "
+              "diagnose any condition, measure intelligence or brain health, or provide clinically validated "
+              "rehabilitation. If you have health concerns, please speak to a qualified professional.")
 
 
-# -------------------------------------------------------------------- sidebar
-st.sidebar.markdown("## 🧠 NeuroRevive AI")
-st.sidebar.radio("Navigate", PAGES, key="page", label_visibility="collapsed")
-pid_in = st.sidebar.text_input("Participant ID (nickname, no real names)", value=S.pid, max_chars=30)
-if PID_RE.fullmatch(pid_in):
-    S.pid = pid_in
-else:
-    st.sidebar.error("Use 3-30 letters, numbers, - or _")
-pid = S.pid
-st.sidebar.caption("Demo participant mode: not a login. Anyone who knows an ID can open it.")
-with st.sidebar.expander("Demo tools"):
-    if st.button("Load labelled sample data"):
-        core.generate_sample(pid)
-        st.rerun()
-    if st.button("Remove sample data"):
-        core.delete_sample(pid)
-        st.rerun()
+# ------------------------------------------------------------------ helpers
+@st.cache_resource
+def _init_db():
+    db.init_db()
+    return True
 
 
-# ------------------------------------------------------------------ dashboard
-def page_dashboard():
-    df = core.get_results(pid)
-    hero("NeuroRevive AI", "AI-powered cognitive wellness practice: track your focus and memory "
-         "habits and get a personal routine.")
-    if df.empty:
-        card("Welcome! No results yet",
-             "Take your first mini-task below. Nothing is shown until you have real (or clearly "
-             "labelled sample) results.", "Getting started")
-    else:
-        if df["sample"].any():
-            st.warning("This profile contains labelled SAMPLE data (demo tools in the sidebar).")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Sessions completed", len(df))
-        c2.metric("Latest score", fmt(df["score"].iloc[-1]))
-        c3.metric("Average score", fmt(df["score"].mean()))
-        c4.metric("Practice streak (days)", core.current_streak(df))
-        left, right = st.columns([3, 2])
-        with left:
-            line_chart(df, "score", "Recent task scores", "Score (0-100)")
-        with right:
-            st.markdown("**Recent activity**")
-            recent = df.tail(6).iloc[::-1][["created", "task_name", "difficulty", "score"]]
-            recent["created"] = recent["created"].dt.strftime("%d %b %H:%M")
-            recent.columns = ["When (UTC)", "Task", "Level", "Score"]
-            st.dataframe(recent, hide_index=True, use_container_width=True)
-    a = core.analyse(df)
-    nxt = core.next_activity(df, a["recs"]) if not df.empty else a["recs"][0]
-    card(f"Recommended next: {core.TASKS[nxt['task']]} ({nxt['difficulty']})", nxt["reason"],
-         a["source"])
-    st.markdown("### Start a task")
-    cols = st.columns(3)
-    for col, (name, desc) in zip(cols, [
-            ("Memory Matrix", "Memorise a digit sequence, then recall it."),
-            ("Focus Finder", "Spot every target among look-alike distractors."),
-            ("Reaction Rush", "React to the green cue; avoid false starts.")]):
-        with col:
-            card(name, desc)
-            st.button(f"Open {name}", key=f"go_{name}", on_click=go, args=(name,),
-                      use_container_width=True)
-    disclaimer()
+def go(page: str):
+    st.session_state["nav"] = page
 
 
-# --------------------------------------------------------------- memory matrix
-def page_memory():
-    hero("Memory Matrix", "Memorise the digits. They disappear. Type them back.")
-    m = S.setdefault("mem", {"stage": "idle"})
-    if m["stage"] == "idle":
-        level = st.radio("Difficulty", core.LEVELS, horizontal=True, format_func=str.title)
-        n, sec = core.MEMORY_CFG[level]
-        st.info(f"You'll see {n} digits for {n * sec:.1f} seconds, then type them from memory.")
-        if st.button("Start", type="primary"):
-            seed = random.randint(1, 10**9)
-            m.update(stage="show", level=level, seed=seed, seq=core.generate_sequence(level, seed),
-                     attempt=uuid.uuid4().hex)
-            st.rerun()
-    elif m["stage"] == "show":
-        n, sec = core.MEMORY_CFG[m["level"]]
-        ph = st.empty()
-        ph.markdown(f"<div class='stimulus'>{' '.join(m['seq'])}</div>", unsafe_allow_html=True)
-        time.sleep(n * sec)
-        ph.empty()
-        m.update(stage="answer", t0=time.time())
-        st.rerun()
-    elif m["stage"] == "answer":
-        st.markdown("<div class='stimulus'>? ? ?</div>", unsafe_allow_html=True)
-        with st.form("mem_form"):
-            ans = st.text_input("Type the digits you saw", max_chars=20)
-            ok = st.form_submit_button("Submit", type="primary")
-        if ok:
-            if not any(ch.isdigit() for ch in ans):
-                st.warning("Please enter at least one digit.")
-            else:
-                dur = time.time() - m["t0"]
-                res = core.score_memory(m["seq"], ans)
-                core.save_result(pid, "memory", m["level"], res["score"],
-                                 accuracy=res["score"] / 100, duration_s=round(dur, 1),
-                                 attempt=m["attempt"])
-                m.update(stage="result", res=res, ans=ans, dur=dur)
-                st.rerun()
-    else:
-        res = m["res"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Score", f"{res['score']:.0f}")
-        c2.metric("Digits correct", f"{res['correct']}/{res['total']}")
-        c3.metric("Recall time", f"{m['dur']:.1f}s")
-        st.write(f"Sequence: `{m['seq']}`  ·  Your answer: `{m['ans']}`")
-        st.success("Result saved.")
-        if st.button("Play again", type="primary"):
-            S["mem"] = {"stage": "idle"}
-            st.rerun()
-    disclaimer()
+def get_secret(name):
+    val = os.environ.get(name)
+    if val:
+        return val
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
 
 
-# ---------------------------------------------------------------- focus finder
-def page_focus():
-    hero("Focus Finder", "Find every target among the distractors.")
-    f = S.setdefault("foc", {"stage": "idle"})
-    if f["stage"] == "idle":
-        level = st.radio("Difficulty", core.LEVELS, horizontal=True, format_func=str.title)
-        rows, cols, k, target, _ = core.FOCUS_CFG[level]
-        st.info(f"Tick every **{target}** in a {rows}×{cols} grid ({k} targets hidden). "
-                f"Accuracy decides your score; time is shown separately.")
-        if st.button("Start", type="primary"):
-            seed = random.randint(1, 10**9)
-            cells, targets = core.generate_grid(level, seed)
-            f.update(stage="play", level=level, seed=seed, cells=cells, targets=targets,
-                     attempt=uuid.uuid4().hex, t0=time.time())
-            st.rerun()
-    elif f["stage"] == "play":
-        rows, cols, k, target, _ = core.FOCUS_CFG[f["level"]]
-        st.markdown(f"### Target: <span class='badge'>{target}</span> — tick every {target}",
-                    unsafe_allow_html=True)
-        with st.form("foc_form"):
-            picks = {}
-            for r in range(rows):
-                cs = st.columns(cols)
-                for c in range(cols):
-                    i = r * cols + c
-                    picks[i] = cs[c].checkbox(f["cells"][i], key=f"foc_{f['attempt']}_{i}")
-            ok = st.form_submit_button("Submit", type="primary")
-        if ok:
-            dur = time.time() - f["t0"]
-            picked = [i for i, v in picks.items() if v]
-            res = core.score_focus(f["targets"], picked)
-            core.save_result(pid, "focus", f["level"], res["score"], accuracy=res["accuracy"],
-                             duration_s=round(dur, 1), attempt=f["attempt"])
-            f.update(stage="result", res=res, dur=dur)
-            st.rerun()
-    else:
-        res = f["res"]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Score (accuracy)", f"{res['score']:.0f}")
-        c2.metric("Targets found", res["tp"])
-        c3.metric("Missed / wrong picks", f"{res['fn']} / {res['fp']}")
-        c4.metric("Time (not scored)", f"{f['dur']:.1f}s")
-        st.success("Result saved.")
-        if st.button("Retry", type="primary"):
-            S["foc"] = {"stage": "idle"}
-            st.rerun()
-    disclaimer()
-
-
-# --------------------------------------------------------------- reaction rush
-RX_ROUNDS = 5
-
-
-def new_rx():
-    return {"stage": "idle", "round": 1, "cue_at": 0.0, "rts": [], "false": 0, "note": "",
-            "attempt": uuid.uuid4().hex, "t0": 0.0, "summary": None}
-
-
-def _schedule(rx):
-    rx["cue_at"] = time.time() + random.uniform(1.5, 4.0)
-
-
-@st.fragment(run_every=0.1)
-def reaction_fragment():
-    rx = S["rx"]
-    if rx["stage"] == "wait" and time.time() >= rx["cue_at"]:
-        rx["stage"] = "cue"
-    stage = rx["stage"]
-    if stage == "idle":
-        st.markdown("<div class='rx-box rx-idle'>Ready?</div>", unsafe_allow_html=True)
-        if st.button("Start test", type="primary", key="rx_start"):
-            rx.update(stage="wait", t0=time.time())
-            _schedule(rx)
-            st.rerun(scope="fragment")
-    elif stage == "wait":
-        st.markdown("<div class='rx-box rx-wait'>Wait for green…</div>", unsafe_allow_html=True)
-        st.caption(f"Round {rx['round']} of {RX_ROUNDS}  ·  {rx['note']}")
-        if st.button("Click", key=f"rxw_{rx['round']}_{rx['false']}"):
-            rx["false"] += 1
-            rx["note"] = "False start! Wait for green."
-            _schedule(rx)
-            st.rerun(scope="fragment")
-    elif stage == "cue":
-        st.markdown("<div class='rx-box rx-go'>CLICK NOW!</div>", unsafe_allow_html=True)
-        st.caption(f"Round {rx['round']} of {RX_ROUNDS}")
-        if st.button("Click", type="primary", key=f"rxc_{rx['round']}"):
-            rt = (time.time() - rx["cue_at"]) * 1000
-            if rt < 100:  # implausibly fast = anticipation, count as false start
-                rx["false"] += 1
-                rx["note"] = "Too fast to be a reaction: counted as a false start."
-                rx["stage"] = "wait"
-                _schedule(rx)
-            else:
-                rx["rts"].append(rt)
-                rx["note"] = f"Round {rx['round']}: {rt:.0f} ms"
-                rx["round"] += 1
-                if rx["round"] > RX_ROUNDS:
-                    res = core.score_reaction(rx["rts"], rx["false"])
-                    core.save_result(S["pid"], "reaction", "standard", res["score"],
-                                     accuracy=res["accuracy"], rt_ms=res["mean"], rt_sd=res["sd"],
-                                     duration_s=round(time.time() - rx["t0"], 1),
-                                     attempt=rx["attempt"])
-                    rx.update(stage="done", summary=res)
-                else:
-                    rx["stage"] = "wait"
-                    _schedule(rx)
-            st.rerun(scope="fragment")
-    else:
-        res = rx["summary"]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Score", f"{res['score']:.0f}")
-        c2.metric("Mean reaction", fmt(res["mean"], " ms"))
-        c3.metric("Variation (SD)", fmt(res["sd"], " ms"))
-        c4.metric("False starts", rx["false"])
-        st.write("Rounds: " + ", ".join(f"{r:.0f} ms" for r in rx["rts"]))
-        st.success("Result saved.")
-        if st.button("Run again", type="primary", key="rx_again"):
-            S["rx"] = new_rx()
-            st.rerun(scope="fragment")
-
-
-def page_reaction():
-    hero("Reaction Rush", f"{RX_ROUNDS} rounds. Click only when the box turns green.")
-    S.setdefault("rx", new_rx())
-    st.info("Times are measured in the app server and include network and browser delay, so they "
-            "are approximate (not laboratory-grade) and only comparable on the same device and "
-            "connection.")
-    reaction_fragment()
-    disclaimer()
-
-
-# -------------------------------------------------------------------- analysis
-def page_analysis():
-    hero("AI performance analysis", "ML forecast + rule engine + LLM coach, all from your saved results.")
-    df = core.get_results(pid)
-    if df.empty:
-        st.info("No results yet. Complete a task first.")
-        return
-    a = core.analyse(df)
-    fc = core.ml_forecast(df)
-    risk = core.dropoff_risk(df)
-
-    st.markdown("#### 📈 ML forecast (scikit-learn regression trained on your history)")
-    cols = st.columns(3)
-    for col, (t, name) in zip(cols, core.TASKS.items()):
-        f = fc[t]
-        if f["ready"]:
-            col.metric(name, f"{f['next_pred']:.0f} predicted next", f"trend: {f['trend']}",
-                       delta_color="off")
-            col.caption(f"slope {f['slope']:+.1f}/attempt · R² {f['r2']}")
+def ensure_pid() -> str:
+    if "pid" not in st.session_state:
+        qp = st.query_params.get("pid")
+        if qp and PID_RE.match(qp):
+            st.session_state["pid"] = qp
         else:
-            col.metric(name, "—", f"needs 4+ attempts ({f['n']} so far)", delta_color="off")
-    if risk:
-        st.markdown(f"<span class='badge amber'>Practice drop-off risk: {risk['level']}</span> "
-                    f"{risk['days_since_last_practice']} day(s) since last session, "
-                    f"{risk['sessions_last_14_days']} session(s) in 14 days.", unsafe_allow_html=True)
-
-    st.markdown("#### What your saved results show")
-    for line in a["findings"] or ["Not enough attempts yet for a summary."]:
-        st.write("• " + line)
-    badge = {"up": "Step up", "down": "Ease off", "keep": "Keep going",
-             "assess": "Initial assessment", "consistency": "Consistency"}
-    for r in a["recs"]:
-        card(f"{core.TASKS[r['task']]} → {r['difficulty']}", r["reason"], badge[r["action"]])
-    st.caption(a["caveat"])
-
-    st.markdown("#### 🧠 AI coach (large language model)")
-    lang = st.radio("Language", ["English", "Urdu"], horizontal=True)
-    keys = get_keys()
-    if not keys:
-        st.info("No AI API key configured, so the LLM coach is off. The ML forecast and "
-                "rule-based analysis above still work.")
-    elif st.button("Ask the AI coach", type="primary"):
-        try:
-            with st.spinner("AI coach is thinking..."):
-                data, model = core.llm_coach(core.stats_payload(df, fc, a, risk), lang, keys)
-            S["coach"] = (data, model, lang)
-        except Exception as e:
-            S.pop("coach", None)
-            st.warning(f"AI coach unavailable ({type(e).__name__}). Showing ML/rule-based results only.")
-    if "coach" in S:
-        data, model, lg = S["coach"]
-        rtl = " dir='rtl'" if lg == "Urdu" else ""
-        tips = "".join(f"<li>{t}</li>" for t in data["tips"])
-        st.markdown(f"<span class='badge'>AI-generated · {model}</span>"
-                    f"<div class='card'{rtl}><p>{data['summary']}</p><ul>{tips}</ul></div>",
-                    unsafe_allow_html=True)
-    disclaimer()
+            st.session_state["pid"] = "guest-" + uuid.uuid4().hex[:6]
+        st.query_params["pid"] = st.session_state["pid"]
+    return st.session_state["pid"]
 
 
-# ------------------------------------------------------------------------ plan
-def _toggle(days, day, item, key):
-    core.set_done(pid, days, day, item, bool(S[key]))
+def switch_pid(new_pid: str):
+    st.session_state["pid"] = new_pid
+    st.query_params["pid"] = new_pid
+    for k in ("mem", "foc", "rr", "ai_text"):
+        st.session_state.pop(k, None)
+    st.rerun()
 
 
-def page_plan():
-    hero("Training plan", "A short daily routine built from your results.")
-    df = core.get_results(pid)
-    a = core.analyse(df)
-    days = st.radio("Plan length", [7, 14], horizontal=True, format_func=lambda d: f"{d}-day")
-    lang = st.radio("Plan language", ["English", "Urdu"], horizontal=True)
+def style_fig(fig):
+    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      margin=dict(l=10, r=10, t=40, b=10), legend_title_text="",
+                      font=dict(color="#E6E9F5"))
+    return fig
+
+
+def quick_links(prefix: str):
+    cols = st.columns(3)
+    for col, (key, name) in zip(cols, logic.TASKS.items()):
+        col.button(f"Open {name}", key=f"{prefix}_{key}", on_click=go, args=(TASK_PAGE[key],),
+                   use_container_width=True)
+
+
+def recent_table(df, n=6):
+    t = df.sort_values(["created_at", "id"], ascending=False).head(n)
+    return pd.DataFrame({
+        "When (UTC)": t["created_at"].dt.strftime("%Y-%m-%d %H:%M"),
+        "Task": t["task"].map(logic.TASKS),
+        "Difficulty": t["difficulty"].str.title(),
+        "Score": t["score"].astype(float).round(0),
+        "Accuracy %": t["accuracy"].astype(float).round(0),
+        "Sample": t["is_sample"].map({1: "sample", 0: ""}),
+    })
+
+
+def sample_controls(pid, has_sample, prefix):
+    st.caption("Sample data is generated, not real performance. It is flagged in the database and can be removed.")
     c1, c2 = st.columns(2)
-    if c1.button("✨ Generate AI plan", type="primary", use_container_width=True):
-        keys, plan, label = get_keys(), None, None
-        if keys:
-            try:
-                with st.spinner("AI is building your plan..."):
-                    stats = core.stats_payload(df, core.ml_forecast(df), a, core.dropoff_risk(df))
-                    plan, model = core.llm_plan(days, stats, lang, keys)
-                label = f"AI-generated plan ({model})"
-            except Exception as e:
-                S["plan_msg"] = f"AI unavailable ({type(e).__name__}). Used the rule-based plan instead."
-        else:
-            S["plan_msg"] = "No AI API key set. Used the rule-based plan instead."
-        if plan is None:
-            plan, label = core.build_plan(days, a["recs"])
-        core.save_plan(pid, days, plan, label)
+    if c1.button("Load sample data", key=f"{prefix}_load"):
+        for row in logic.sample_rows():
+            db.save_result(pid, is_sample=True, **row)
         st.rerun()
-    if c2.button("Rule-based plan", use_container_width=True):
-        plan, label = core.build_plan(days, a["recs"])
-        core.save_plan(pid, days, plan, label)
+    if has_sample and c2.button("Remove sample data", key=f"{prefix}_remove"):
+        db.delete_sample_results(pid)
         st.rerun()
-    if "plan_msg" in S:
-        st.warning(S.pop("plan_msg"))
-    saved = core.get_plan(pid, days)
-    if not saved:
-        st.info("No plan yet. Click a button above (regenerating resets progress).")
-        return
-    plan, label = saved
-    done = core.get_done(pid, days)
-    total = sum(len(d["items"]) for d in plan)
-    st.markdown(f"<span class='badge amber'>{label}</span>", unsafe_allow_html=True)
-    if label == "Starter plan":
-        st.caption("Starter plan: you need at least 2 attempts per task before it can be personalised.")
-    st.progress(len(done) / total, text=f"{len(done)} of {total} exercises completed")
-    for d in plan:
-        n_done = sum(1 for i in range(len(d["items"])) if (d["day"], i) in done)
-        with st.expander(f"Day {d['day']}: {n_done}/{len(d['items'])} done"):
-            for i, it in enumerate(d["items"]):
-                key = f"plan_{pid}_{days}_{d['day']}_{i}"
-                st.checkbox(f"{core.TASKS[it['task']]} · {it['difficulty']} · {it['minutes']} min. "
-                            f"{it['purpose']}", value=(d["day"], i) in done, key=key,
-                            on_change=_toggle, args=(days, d["day"], i, key))
-    disclaimer()
 
 
-# -------------------------------------------------------------------- progress
-def page_progress():
-    hero("Progress", "Compare like with like. Higher scores are not proof of overall improvement.")
-    df = core.get_results(pid)
+# ------------------------------------------------------------------ pages
+def page_dashboard(pid, df):
+    st.markdown(
+        '<div class="nr-hero"><span class="nr-pill">Prototype · cognitive task practice</span>'
+        "<h1>NeuroRevive AI</h1>"
+        "<p>Practise short, repeatable cognitive tasks, review how your results change, and follow a "
+        "personalised practice routine built from your own task results.</p></div>",
+        unsafe_allow_html=True)
+    st.caption(DISCLAIMER)
+
     if df.empty:
-        st.info("No results yet. Complete a task to see your progress.")
+        st.markdown(
+            '<div class="nr-card"><span class="nr-pill">Getting started</span><h3>No results yet</h3>'
+            "<p>Complete your first mini-test to see scores, trends and a personalised recommendation. "
+            "Start with any of the three tasks below.</p></div>", unsafe_allow_html=True)
+        quick_links("empty")
+        with st.expander("Presenting a demo? Load clearly labelled sample data"):
+            sample_controls(pid, False, "dash_empty")
         return
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Sessions", len(df))
-    for col, d in zip((c2, c3), (7, 14)):
-        pc = core.plan_completion(pid, d)
-        col.metric(f"{d}-day plan", f"{pc[0]}/{pc[1]}" if pc else "no plan")
-    line_chart(df, "score", "Score over time", "Score (0-100)")
-    line_chart(df, "accuracy", "Accuracy over time", "Accuracy (0-1)")
-    line_chart(df, "rt_ms", "Mean reaction time (lower = faster)", "ms")
-    st.markdown("#### Previous vs latest attempt")
-    cols = st.columns(3)
-    for col, (t, name) in zip(cols, core.TASKS.items()):
-        d = df[df["task"] == t]
-        with col:
-            if len(d) < 2:
-                st.metric(name, fmt(d["score"].iloc[-1]) if len(d) else "—", help="Need 2+ attempts")
-            elif d["difficulty"].iloc[-1] != d["difficulty"].iloc[-2]:
-                st.metric(name, fmt(d["score"].iloc[-1]))
-                st.caption("Last two attempts were at different difficulty, so not directly comparable.")
+
+    has_sample = bool(df["is_sample"].any())
+    if has_sample:
+        st.warning("This view includes **sample data** (generated, not real performance).")
+
+    latest = df.sort_values(["created_at", "id"]).iloc[-1]
+    streak = logic.practice_streak(set(df["created_at"].dt.date), datetime.now(timezone.utc).date())
+    c = st.columns(4)
+    c[0].metric("Completed sessions", len(df))
+    c[1].metric("Latest score", f"{latest['score']:.0f}", help=f"Task: {logic.TASKS[latest['task']]}")
+    c[2].metric("Average score (all tasks)", f"{df['score'].astype(float).mean():.0f}")
+    c[3].metric("Practice streak (UTC days)", f"{streak}")
+
+    t, why = logic.pick_next_task(df)
+    rec = logic.recommend_task(df, t)
+    left, right = st.columns([3, 2])
+    with left:
+        plot = df.assign(Task=df["task"].map(logic.TASKS))
+        fig = px.line(plot, x="created_at", y="score", color="Task", markers=True,
+                      color_discrete_sequence=PALETTE, labels={"created_at": "Date", "score": "Score"})
+        fig.update_yaxes(range=[0, 105])
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+        st.caption("Scores come from different tasks and difficulty levels. Compare each line only with itself.")
+    with right:
+        st.markdown(
+            f'<div class="nr-card"><span class="nr-pill">Recommended next</span>'
+            f"<h3>{logic.TASKS[t]} · {rec['difficulty'].title()}</h3><p>{why}</p><p>{rec['detail']}</p></div>",
+            unsafe_allow_html=True)
+        st.button(f"Start {logic.TASKS[t]}", type="primary", on_click=go, args=(TASK_PAGE[t],), key="dash_next")
+
+    st.subheader("Recent activity")
+    st.dataframe(recent_table(df), hide_index=True, use_container_width=True)
+    st.subheader("Quick links")
+    quick_links("dash")
+
+
+def page_analysis(pid, df):
+    st.header("🔍 Performance analysis")
+    if df.empty:
+        st.info("No saved results yet. Complete at least one attempt of each task to unlock analysis.")
+        quick_links("an_empty")
+        return
+    recs = {k: logic.recommend_task(df, k) for k in logic.TASKS}
+    st.dataframe(logic.summarize_tasks(df), hide_index=True, use_container_width=True)
+    if not logic.is_personalised(recs):
+        st.info("Some tasks have fewer than two attempts, so recommendations there are limited. "
+                "Complete the suggested initial assessments before relying on a personalised plan.")
+
+    st.subheader("Recommendations")
+    for k, rec in recs.items():
+        st.markdown(
+            f'<div class="nr-card"><span class="nr-pill">Rule-based · {rec["rule"]}</span>'
+            f"<h3>{rec['headline']}</h3><p>{rec['detail']}</p>"
+            f"<p><strong>Suggested level:</strong> {rec['difficulty'].title()}</p></div>",
+            unsafe_allow_html=True)
+
+    st.subheader("AI explanation (optional)")
+    api_key = get_secret("ANTHROPIC_API_KEY")
+    if not api_key:
+        st.info("No API key is configured, so the recommendations above come from transparent rules only. "
+                "No AI model was called.")
+    else:
+        st.caption("Only the aggregated numbers above are sent to the model. No participant ID is included.")
+        if st.button("Generate AI explanation", key="ai_btn"):
+            with st.spinner("Asking the model…"):
+                try:
+                    model = get_secret("LLM_MODEL") or llm.DEFAULT_MODEL
+                    st.session_state["ai_text"] = (llm.explain(logic.llm_payload(df, recs), api_key, model), model)
+                except Exception as exc:
+                    st.warning(f"The AI call failed ({type(exc).__name__}). The rule-based results above still apply.")
+        if st.session_state.get("ai_text"):
+            text, model = st.session_state["ai_text"]
+            st.markdown(f'<span class="nr-pill">AI-generated · {model}</span>', unsafe_allow_html=True)
+            st.write(text)
+    st.caption("A few game scores are noisy and affected by practice, mood, device and distraction. "
+               "Nothing here is a statement about intelligence, brain health or any medical condition.")
+
+
+def _toggle_item(pid, item_id, widget_key):
+    plan = db.load_plan(pid)
+    if plan is None:
+        return
+    done = set(plan.get("done", []))
+    if st.session_state.get(widget_key):
+        done.add(item_id)
+    else:
+        done.discard(item_id)
+    plan["done"] = sorted(done)
+    db.save_plan(pid, plan)
+
+
+def page_plan(pid, df):
+    st.header("🗓️ Training plan")
+    plan = db.load_plan(pid)
+    if plan is None:
+        length = st.radio("Plan length", [7, 14], horizontal=True, format_func=lambda d: f"{d}-day")
+        recs = {k: logic.recommend_task(df, k) for k in logic.TASKS}
+        personalised = logic.is_personalised(recs)
+        if personalised:
+            st.success("Your plan will use your recent results to choose each task's difficulty.")
+        else:
+            st.info("You don't have enough results for every task yet, so this will be a **starter plan** "
+                    "(easy levels where there is no data). Regenerate it after more attempts.")
+        if st.button("Generate plan", type="primary", key="plan_gen"):
+            new = logic.build_plan(length, recs, logic.baseline_difficulties(df), personalised)
+            if db.save_plan(pid, new):
+                st.rerun()
             else:
-                st.metric(name, fmt(d["score"].iloc[-1]),
-                          f"{d['score'].iloc[-1] - d['score'].iloc[-2]:+.0f} vs previous")
-    st.caption("Early gains often reflect practice effects (getting used to the task). Short games "
-               "are noisy, so treat trends as practice feedback only.")
-    st.download_button("Download my results (CSV backup)", df.to_csv(index=False), "neurorevive_results.csv")
-    disclaimer()
+                st.error("Could not save the plan.")
+        return
+
+    created = datetime.fromisoformat(plan["created_at"])
+    today_n = max(1, min(plan["length"], (datetime.now(timezone.utc).date() - created.date()).days + 1))
+    total = sum(len(d["items"]) for d in plan["days"])
+    done = set(plan.get("done", []))
+    st.markdown(f'<span class="nr-pill">{plan["label"]} · {plan["length"]} days</span>', unsafe_allow_html=True)
+    st.progress(len(done) / total, text=f"{len(done)} of {total} exercises completed")
+    nxt = logic.next_plan_item(plan)
+    if nxt:
+        st.info(f"Next up: Day {nxt[0]} · {logic.TASKS[nxt[1]['task']]} ({nxt[1]['difficulty'].title()})")
+        st.button(f"Open {logic.TASKS[nxt[1]['task']]}", on_click=go, args=(TASK_PAGE[nxt[1]["task"]],), key="plan_open")
+    else:
+        st.success("Plan complete. Re-take each task and compare like-for-like on the Progress page.")
+
+    for day in plan["days"]:
+        n_done = sum(1 for it in day["items"] if it["id"] in done)
+        marker = " (today)" if day["day"] == today_n else ""
+        with st.expander(f"Day {day['day']} · {day['title']}{marker} - {n_done}/{len(day['items'])} done",
+                         expanded=day["day"] == today_n):
+            for it in day["items"]:
+                wkey = f"plan_{pid}_{plan['created_at']}_{it['id']}"
+                st.checkbox(f"{logic.TASKS[it['task']]} · {it['difficulty'].title()} · {it['minutes']} min",
+                            value=it["id"] in done, key=wkey, on_change=_toggle_item,
+                            args=(pid, it["id"], wkey))
+                st.caption(it["purpose"])
+    st.caption("Tick exercises yourself after completing them. Completion is self-reported, not detected automatically.")
+    with st.expander("Replace this plan"):
+        if st.button("Delete plan and start over", key="plan_del"):
+            db.delete_plan(pid)
+            st.rerun()
 
 
-# ------------------------------------------------------------------- reminders
-def page_reminders():
-    hero("Reminders", "Pick a daily practice time and add it to your own calendar.")
-    df = core.get_results(pid)
-    a = core.analyse(df)
-    cur = core.get_time(pid)
-    t = st.time_input("Preferred daily practice time",
-                      value=pd.to_datetime(cur, format="%H:%M").time())
-    if st.button("Save time", type="primary"):
-        core.set_time(pid, t.strftime("%H:%M"))
-        st.success("Saved.")
-    nxt = core.next_activity(df, a["recs"]) if not df.empty else a["recs"][0]
-    card("Next recommended session",
-         f"Daily at {t.strftime('%H:%M')}: {core.TASKS[nxt['task']]} ({nxt['difficulty']}).")
-    days = st.radio("Calendar reminder length", [7, 14], horizontal=True)
-    st.download_button("Download calendar reminder (.ics)",
-                       core.make_ics(t.strftime("%H:%M"), days, core.TASKS[nxt["task"]]),
-                       "neurorevive_reminder.ics", "text/calendar")
-    st.caption("This app cannot send push notifications. The .ics file adds repeating reminders to "
-               "your own calendar app, which then notifies you.")
+def page_progress(pid, df):
+    st.header("📈 Progress")
+    if df.empty:
+        st.info("No results yet. Complete a task and your history will appear here.")
+        quick_links("pr_empty")
+        with st.expander("Presenting a demo? Load clearly labelled sample data"):
+            sample_controls(pid, False, "pr_empty")
+        return
+    if df["is_sample"].any():
+        st.warning("This view includes **sample data**.")
+
+    plan = db.load_plan(pid)
+    c = st.columns(3)
+    c[0].metric("Completed sessions", len(df))
+    if plan:
+        total = sum(len(d["items"]) for d in plan["days"])
+        c[1].metric("Plan completion", f"{len(plan.get('done', []))}/{total}")
+    else:
+        c[1].metric("Plan completion", "No plan")
+    c[2].metric("Tasks tried", df["task"].nunique())
+
+    task = st.selectbox("Task", list(logic.TASKS), format_func=logic.TASKS.get)
+    rows = logic.task_rows(df, task)
+    if rows.empty:
+        st.info(f"No {logic.TASKS[task]} results yet.")
+    else:
+        rows = rows.assign(Attempt=list(range(1, len(rows) + 1)))
+        rows["Difficulty"] = rows["difficulty"].str.title()
+        l, r = st.columns(2)
+        fig = px.line(rows, x="Attempt", y="score", color="Difficulty", markers=True,
+                      color_discrete_sequence=PALETTE, title="Score by attempt")
+        fig.update_yaxes(range=[0, 105])
+        l.plotly_chart(style_fig(fig), use_container_width=True)
+        ycol, ytitle = ("median_ms", "Median reaction (ms), lower is faster") if task == "reaction" \
+            else ("accuracy", "Accuracy (%)")
+        fig2 = px.line(rows, x="Attempt", y=ycol, color="Difficulty", markers=True,
+                       color_discrete_sequence=PALETTE, title=ytitle)
+        r.plotly_chart(style_fig(fig2), use_container_width=True)
+
+        cmp = logic.compare_latest(rows)
+        if cmp:
+            prev, last = cmp
+            st.subheader("Previous vs latest (same difficulty)")
+            m = st.columns(2)
+            m[0].metric("Score", f"{last['score']:.0f}", f"{last['score'] - prev['score']:+.0f}")
+            if task == "reaction" and pd.notna(last["median_ms"]) and pd.notna(prev["median_ms"]):
+                m[1].metric("Median reaction (ms)", f"{last['median_ms']:.0f}",
+                            f"{last['median_ms'] - prev['median_ms']:+.0f}", delta_color="inverse")
+            elif task != "reaction":
+                m[1].metric("Accuracy", f"{float(last['accuracy']):.0f}%",
+                            f"{float(last['accuracy']) - float(prev['accuracy']):+.0f}")
+        else:
+            st.caption("Two attempts at the same difficulty are needed for a like-for-like comparison.")
+
+    st.info("Higher scores on a task mean better performance **on that task**. They are not proof of overall "
+            "cognitive improvement. Repeating a task causes practice effects (you get better at the task itself), "
+            "and results vary with device, mood, sleep and distraction. Compare like-for-like only.")
+
+    with st.expander("Data tools"):
+        export = df[["created_at", "task", "difficulty", "score", "accuracy", "duration_s", "is_sample"]]
+        st.download_button("Download my results (CSV)", export.to_csv(index=False).encode("utf-8"),
+                           "neurorevive_results.csv", "text/csv")
+        sample_controls(pid, bool(df["is_sample"].any()), "pr")
+        confirm = st.checkbox("I understand this permanently deletes all data for this participant ID",
+                              key="del_confirm")
+        if st.button("Delete all my data", disabled=not confirm, key="del_btn"):
+            db.delete_participant_data(pid)
+            st.rerun()
 
 
-# ----------------------------------------------------------------------- about
+def page_reminders(pid, df):
+    st.header("⏰ Reminders")
+    saved = db.get_pref(pid, "reminder_time") or "18:00"
+    try:
+        h, m = (int(x) for x in saved.split(":"))
+    except ValueError:
+        h, m = 18, 0
+    chosen = st.time_input("Preferred daily practice time", value=dtime(h, m), step=900)
+    if st.button("Save preferred time", key="rem_save"):
+        if db.set_pref(pid, "reminder_time", chosen.strftime("%H:%M")):
+            st.success("Saved.")
+    hhmm = chosen.strftime("%H:%M")
+
+    plan = db.load_plan(pid)
+    nxt = logic.next_plan_item(plan) if plan else None
+    if nxt:
+        suggestion = f"Day {nxt[0]} of your plan: {logic.TASKS[nxt[1]['task']]} ({nxt[1]['difficulty'].title()})"
+    else:
+        t, _ = logic.pick_next_task(df) if not df.empty else ("memory", "")
+        suggestion = f"{logic.TASKS[t]} (no active plan; generate one on the Training Plan page)"
+    st.markdown(f'<div class="nr-card"><span class="nr-pill">Next recommended session</span>'
+                f"<h3>Daily at {hhmm}</h3><p>{suggestion}</p></div>", unsafe_allow_html=True)
+
+    days = plan["length"] if plan else 7
+    st.download_button("Download calendar reminder (.ics)", logic.make_ics(hhmm, days),
+                       "neurorevive-reminder.ics", "text/calendar")
+    st.caption("The .ics file adds a repeating daily event to your own calendar app, using your local time zone. "
+               "This web app does not send push notifications or emails.")
+
+
 def page_about():
-    hero("About & responsible use", "How NeuroRevive AI works and what it can't do.")
-    st.markdown("""
-**The problem.** Many people, students and busy adults alike, have no simple way to practise attention and memory skills or to notice when their practice habits slip. NeuroRevive AI offers short practice tasks, uses machine learning to forecast task-performance trends, warns when practice is dropping off, and builds a personal 7/14-day wellness routine in English or Urdu. It is a self-monitoring practice tool, not a screening or diagnostic tool.
+    st.header("ℹ️ About & how it works")
+    st.markdown(DISCLAIMER)
+    with st.expander("The problem we're exploring", expanded=True):
+        st.write("Educators have raised concerns about students' attention, memory and concentration. "
+                 "This prototype explores whether short, repeatable tasks and personalised practice can help "
+                 "people notice their own task performance and build a consistent practice habit. "
+                 "We make no claim that it fixes or measures those concerns.")
+    with st.expander("How the tests and scores work"):
+        st.markdown(
+            "- **Memory Matrix:** memorise highlighted cells, then tick them. Accuracy = targets found ÷ targets. "
+            "Score = (targets found − false alarms) ÷ targets × 100.\n"
+            "- **Focus Finder:** tick every target among look-alike distractors. Same accuracy/score formulas. "
+            "Completion time is recorded but **not** part of the score. Each grid has a seed, so it can be reproduced.\n"
+            "- **Reaction Rush:** 5 rounds. Score maps median reaction time (1200 ms → 0, 300 ms → 100) minus 10 per "
+            "false start. Timing runs through the server and includes network delay.")
+    with st.expander("How recommendations are generated"):
+        st.markdown(
+            "Interpretable rules (their IDs are shown next to each recommendation):\n"
+            "- **R1/R2:** fewer than two attempts → complete an initial assessment first.\n"
+            "- **R3:** the last two attempts at a level averaged ≥ 85% accuracy → suggest one level up.\n"
+            "- **R4:** the last two attempts averaged < 50% → suggest one level down.\n"
+            "- **R5:** otherwise repeat the level.\n"
+            "- **R6–R8 (reaction):** many false starts → slow down; high variability → more rounds under "
+            "consistent conditions; otherwise keep a steady routine.\n\n"
+            "If an API key is configured, an optional language model may *explain* those numbers in plain words. "
+            "It only receives aggregated statistics and is told not to make medical claims.")
+    with st.expander("What data is stored"):
+        st.write("An anonymous participant ID, task name, difficulty, score, accuracy, timings, your training plan, "
+                 "and your preferred reminder time. No names, emails or other personal details are requested. "
+                 "There is no password: anyone who knows an ID can view that ID's results, so don't use your real "
+                 "name. You can export or delete your data on the Progress page.")
+    with st.expander("Limitations"):
+        st.markdown(
+            "- A handful of game scores is a noisy signal affected by practice, mood, sleep, device and distraction.\n"
+            "- Getting better at a game is not evidence of overall cognitive improvement or decline.\n"
+            "- Reaction timing in a browser has latency; it is not laboratory-grade.\n"
+            "- Free hosting may reset stored data. Export your CSV if it matters.\n"
+            "- This is not a medical device and not a diagnosis.")
 
-**The tasks**
-- **Memory Matrix:** score = % of digits recalled in the correct position.
-- **Focus Finder:** score = F1 of ticked vs true targets (penalises misses and wrong picks). Time is shown separately.
-- **Reaction Rush:** score = 100 − (mean ms − 250)/6 − 8 per false start. Five rounds, random 1.5–4 s waits.
 
-**Where the AI is.** (1) A scikit-learn regression model is trained on your own attempt history to forecast your next score and trend (needs 4+ attempts). (2) A large language model writes your coaching and your 7/14-day plan in English or Urdu; it only receives aggregate numbers, never your ID. (3) If the language model is unavailable, the app falls back to the ML forecast and a transparent rule engine, which looks at your last three attempts per task: average ≥ 85 → try the next difficulty; < 55 → step down; otherwise stay.
+# ------------------------------------------------------------------ main
+def main():
+    st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
+    try:
+        _init_db()
+    except Exception as exc:
+        st.error(f"Could not initialise the database: {exc}")
+        st.stop()
 
-**Data stored.** A nickname you choose, task scores, difficulty, timestamps, plan progress and preferred practice time. No real names, emails or health information.
+    pid = ensure_pid()
+    st.session_state.setdefault("nav", "Dashboard")
 
-**Limitations.** Reaction timing includes network delay. Short games are noisy, practice effects inflate early gains, and results depend on device, sleep, and mood. Prototype storage may reset when the demo app restarts.
+    with st.sidebar:
+        st.markdown("## 🧠 NeuroRevive AI")
+        st.caption("Prototype · cognitive task practice")
+        st.radio("Navigate", PAGES, key="nav")
+        st.divider()
+        with st.form("pid_form"):
+            new = st.text_input("Participant ID (anonymous)", value=pid, max_chars=24,
+                                help="3-24 letters, numbers, - or _. Don't use your real name.")
+            ok = st.form_submit_button("Use this ID")
+        if ok:
+            new = new.strip()
+            if PID_RE.match(new):
+                if new != pid:
+                    switch_pid(new)
+            else:
+                st.error("Use 3-24 letters, numbers, - or _.")
+        st.caption("Bookmark this page's URL to return to your data. Demo mode: no password.")
 
-**Not a diagnosis.** This is not a medical device. It cannot diagnose or screen for any condition or say anything about intelligence or brain health. If you are concerned about attention or memory, talk to a qualified professional.
-""")
+    df = db.load_results(pid)
+    page = st.session_state["nav"]
+    if page == "Dashboard":
+        page_dashboard(pid, df)
+    elif page == "Memory Matrix":
+        games.memory_page(pid)
+    elif page == "Focus Finder":
+        games.focus_page(pid)
+    elif page == "Reaction Rush":
+        games.reaction_page(pid)
+    elif page == "Analysis":
+        page_analysis(pid, df)
+    elif page == "Training Plan":
+        page_plan(pid, df)
+    elif page == "Progress":
+        page_progress(pid, df)
+    elif page == "Reminders":
+        page_reminders(pid, df)
+    else:
+        page_about()
 
 
-{"Dashboard": page_dashboard, "Memory Matrix": page_memory, "Focus Finder": page_focus,
- "Reaction Rush": page_reaction, "Analysis": page_analysis, "Training Plan": page_plan,
- "Progress": page_progress, "Reminders": page_reminders, "About": page_about}[S.page]()
+main()
