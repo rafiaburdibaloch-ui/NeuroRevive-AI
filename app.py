@@ -62,19 +62,58 @@ def llm_keys() -> dict:
 
 
 def ensure_pid() -> str:
+    """Every new browser session starts as its own private guest. The ID is NOT put in the URL."""
     if "pid" not in st.session_state:
-        qp = st.query_params.get("pid")
-        st.session_state["pid"] = qp if qp and PID_RE.match(qp) else "guest-" + uuid.uuid4().hex[:6]
-        st.query_params["pid"] = st.session_state["pid"]
+        st.session_state["pid"] = "guest-" + uuid.uuid4().hex[:8]
+        st.session_state["logged_in"] = False
     return st.session_state["pid"]
 
 
-def switch_pid(new_pid: str):
-    st.session_state["pid"] = new_pid
-    st.query_params["pid"] = new_pid
+def set_user(pid: str, logged_in: bool):
+    st.session_state["pid"] = pid
+    st.session_state["logged_in"] = logged_in
     for k in ("mem", "foc", "rr", "ai_coach"):
         st.session_state.pop(k, None)
     st.rerun()
+
+
+def sidebar_account(pid):
+    if st.session_state.get("logged_in"):
+        st.success(f"Signed in as **{pid}**")
+        if st.button("Log out", key="logout"):
+            set_user("guest-" + uuid.uuid4().hex[:8], False)
+        return
+    st.caption(f"Guest session ({pid}). Data from a guest session can't be recovered after you "
+               "close the page. Create an account to keep your results.")
+    tab_in, tab_new = st.tabs(["Log in", "Create account"])
+    with tab_in:
+        with st.form("login_form"):
+            u = st.text_input("Username", key="li_user")
+            p = st.text_input("Password", type="password", key="li_pass")
+            go_in = st.form_submit_button("Log in")
+        if go_in:
+            if st.session_state.get("fails", 0) >= 5:
+                st.error("Too many failed attempts. Refresh the page to try again.")
+            else:
+                who = core.check_login(u, p)
+                if who:
+                    st.session_state["fails"] = 0
+                    set_user(who, True)
+                else:
+                    st.session_state["fails"] = st.session_state.get("fails", 0) + 1
+                    st.error("Wrong username or password.")
+    with tab_new:
+        with st.form("signup_form"):
+            u2 = st.text_input("Choose a username", max_chars=24, key="su_user",
+                               help="3-24 letters, numbers, - or _. Don't use your real name.")
+            p2 = st.text_input("Choose a password (6+ characters)", type="password", key="su_pass")
+            go_new = st.form_submit_button("Create account")
+        if go_new:
+            ok, msg = core.register_user(u2, p2)
+            if ok:
+                set_user(u2.strip().lower(), True)
+            else:
+                st.error(msg)
 
 
 def style_fig(fig):
@@ -422,9 +461,11 @@ def page_about():
             "coach feedback or a practice plan (English or Urdu). It only receives aggregated statistics, and "
             "plan output is validated before use.")
     with st.expander("What data is stored"):
-        st.write("An anonymous participant ID, task, difficulty, score, accuracy, timings, your plans and tick "
-                 "marks, and your reminder time. There is no password: anyone who knows an ID can view that "
-                 "ID's results, so don't use your real name. Export or delete your data on the Progress page.")
+        st.write("A username (or a random guest ID), a salted and hashed password if you create an account, "
+                 "task, difficulty, score, accuracy, timings, your plans and tick marks, and your reminder time. "
+                 "Each person only sees their own data. This is a lightweight prototype login, not a "
+                 "production-grade security system, so don't use your real name or a password you use "
+                 "elsewhere. Export or delete your data on the Progress page.")
     with st.expander("Limitations"):
         st.markdown(
             "- A handful of game scores is noisy and affected by practice, mood, sleep, device and distraction.\n"
@@ -452,18 +493,7 @@ def main():
         st.radio("Navigate", PAGES, key="nav")
         st.selectbox("AI language", list(core.LANG), key="lang")
         st.divider()
-        with st.form("pid_form"):
-            new = st.text_input("Participant ID (anonymous)", value=pid, max_chars=24,
-                                help="3-24 letters, numbers, - or _. Don't use your real name.")
-            ok = st.form_submit_button("Use this ID")
-        if ok:
-            new = new.strip()
-            if PID_RE.match(new):
-                if new != pid:
-                    switch_pid(new)
-            else:
-                st.error("Use 3-24 letters, numbers, - or _.")
-        st.caption("Bookmark this page's URL to return to your data. Demo mode: no password.")
+        sidebar_account(pid)
 
     df = core.get_results(pid)
     page = st.session_state["nav"]
