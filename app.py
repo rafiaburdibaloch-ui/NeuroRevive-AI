@@ -1,4 +1,4 @@
-"""NeuroRevive AI - Streamlit app. Prototype for cognitive task practice, NOT a diagnostic tool."""
+"""NeuroRevive AI - Streamlit app. Wellness practice prototype, NOT a diagnostic tool."""
 import os
 import random
 import re
@@ -21,8 +21,8 @@ PAGES = ["Dashboard", "Memory Matrix", "Focus Finder", "Reaction Rush", "Analysi
          "Training Plan", "Progress", "Reminders", "About"]
 PID_RE = re.compile(r"[A-Za-z0-9_-]{3,30}")
 COLORS = {"Memory Matrix": "#a78bfa", "Focus Finder": "#22d3ee", "Reaction Rush": "#818cf8"}
-DISCLAIMER = ("⚠️ Prototype for cognitive task practice and self-monitoring. It does not diagnose "
-              "any condition, measure intelligence, or provide clinically validated rehabilitation.")
+DISCLAIMER = ("⚠️ Wellness practice prototype. It does not diagnose, screen or treat any condition, "
+              "and it does not measure intelligence or brain health.")
 
 S = st.session_state
 S.setdefault("page", "Dashboard")
@@ -61,6 +61,17 @@ def line_chart(df, y, title, ytitle):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def get_keys():
+    """API keys live in Streamlit Secrets or environment variables, never in the code."""
+    keys = {}
+    for name in ("GEMINI_API_KEY", "GROQ_API_KEY"):
+        try:
+            keys[name] = st.secrets[name]
+        except Exception:
+            keys[name] = os.getenv(name)
+    return {k: v for k, v in keys.items() if v}
+
+
 # -------------------------------------------------------------------- sidebar
 st.sidebar.markdown("## 🧠 NeuroRevive AI")
 st.sidebar.radio("Navigate", PAGES, key="page", label_visibility="collapsed")
@@ -83,8 +94,8 @@ with st.sidebar.expander("Demo tools"):
 # ------------------------------------------------------------------ dashboard
 def page_dashboard():
     df = core.get_results(pid)
-    hero("NeuroRevive AI", "Interactive cognitive mini-tasks, personalised practice routines and "
-         "honest progress tracking.")
+    hero("NeuroRevive AI", "AI-powered cognitive wellness practice: track your focus and memory "
+         "habits and get a personal routine.")
     if df.empty:
         card("Welcome! No results yet",
              "Take your first mini-task below. Nothing is shown until you have real (or clearly "
@@ -272,7 +283,7 @@ def reaction_fragment():
                 rx["round"] += 1
                 if rx["round"] > RX_ROUNDS:
                     res = core.score_reaction(rx["rts"], rx["false"])
-                    core.save_result(pid, "reaction", "standard", res["score"],
+                    core.save_result(S["pid"], "reaction", "standard", res["score"],
                                      accuracy=res["accuracy"], rt_ms=res["mean"], rt_sd=res["sd"],
                                      duration_s=round(time.time() - rx["t0"], 1),
                                      attempt=rx["attempt"])
@@ -306,44 +317,61 @@ def page_reaction():
 
 
 # -------------------------------------------------------------------- analysis
-def get_key():
-    try:
-        return st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        return os.getenv("ANTHROPIC_API_KEY")
-
-
 def page_analysis():
-    hero("Performance analysis", "Built from your saved task results, using transparent rules.")
+    hero("AI performance analysis", "ML forecast + rule engine + LLM coach, all from your saved results.")
     df = core.get_results(pid)
     if df.empty:
         st.info("No results yet. Complete a task first.")
         return
     a = core.analyse(df)
-    st.markdown(f"<span class='badge violet'>{a['source']}</span>", unsafe_allow_html=True)
+    fc = core.ml_forecast(df)
+    risk = core.dropoff_risk(df)
+
+    st.markdown("#### 📈 ML forecast (scikit-learn regression trained on your history)")
+    cols = st.columns(3)
+    for col, (t, name) in zip(cols, core.TASKS.items()):
+        f = fc[t]
+        if f["ready"]:
+            col.metric(name, f"{f['next_pred']:.0f} predicted next", f"trend: {f['trend']}",
+                       delta_color="off")
+            col.caption(f"slope {f['slope']:+.1f}/attempt · R² {f['r2']}")
+        else:
+            col.metric(name, "—", f"needs 4+ attempts ({f['n']} so far)", delta_color="off")
+    if risk:
+        st.markdown(f"<span class='badge amber'>Practice drop-off risk: {risk['level']}</span> "
+                    f"{risk['days_since_last_practice']} day(s) since last session, "
+                    f"{risk['sessions_last_14_days']} session(s) in 14 days.", unsafe_allow_html=True)
+
     st.markdown("#### What your saved results show")
     for line in a["findings"] or ["Not enough attempts yet for a summary."]:
         st.write("• " + line)
-    st.markdown("#### Personalised practice recommendations")
     badge = {"up": "Step up", "down": "Ease off", "keep": "Keep going",
              "assess": "Initial assessment", "consistency": "Consistency"}
     for r in a["recs"]:
         card(f"{core.TASKS[r['task']]} → {r['difficulty']}", r["reason"], badge[r["action"]])
     st.caption(a["caveat"])
-    st.markdown("#### Optional: AI-written explanation")
-    key = get_key()
-    if not key:
-        st.info("No API key configured, so only the rule-based analysis above is used. "
-                "(Add ANTHROPIC_API_KEY in app secrets to enable this.)")
-    elif st.button("Generate AI explanation (sends aggregate scores only)"):
-        summary = "\n".join(a["findings"] + [f"{r['task']}: {r['reason']}" for r in a["recs"]])
+
+    st.markdown("#### 🧠 AI coach (large language model)")
+    lang = st.radio("Language", ["English", "Urdu"], horizontal=True)
+    keys = get_keys()
+    if not keys:
+        st.info("No AI API key configured, so the LLM coach is off. The ML forecast and "
+                "rule-based analysis above still work.")
+    elif st.button("Ask the AI coach", type="primary"):
         try:
-            with st.spinner("Asking the model..."):
-                text = core.llm_explain(summary, key, os.getenv("NEUROREVIVE_MODEL", "claude-sonnet-5-5"))
-            st.markdown("<span class='badge'>AI-generated</span>", unsafe_allow_html=True)
-            st.write(text)
-        except Exception as e:  # graceful fallback
-            st.warning(f"AI call failed ({type(e).__name__}). Showing rule-based advice only.")
+            with st.spinner("AI coach is thinking..."):
+                data, model = core.llm_coach(core.stats_payload(df, fc, a, risk), lang, keys)
+            S["coach"] = (data, model, lang)
+        except Exception as e:
+            S.pop("coach", None)
+            st.warning(f"AI coach unavailable ({type(e).__name__}). Showing ML/rule-based results only.")
+    if "coach" in S:
+        data, model, lg = S["coach"]
+        rtl = " dir='rtl'" if lg == "Urdu" else ""
+        tips = "".join(f"<li>{t}</li>" for t in data["tips"])
+        st.markdown(f"<span class='badge'>AI-generated · {model}</span>"
+                    f"<div class='card'{rtl}><p>{data['summary']}</p><ul>{tips}</ul></div>",
+                    unsafe_allow_html=True)
     disclaimer()
 
 
@@ -357,13 +385,33 @@ def page_plan():
     df = core.get_results(pid)
     a = core.analyse(df)
     days = st.radio("Plan length", [7, 14], horizontal=True, format_func=lambda d: f"{d}-day")
-    if st.button("Generate / regenerate plan (resets progress)", type="primary"):
+    lang = st.radio("Plan language", ["English", "Urdu"], horizontal=True)
+    c1, c2 = st.columns(2)
+    if c1.button("✨ Generate AI plan", type="primary", use_container_width=True):
+        keys, plan, label = get_keys(), None, None
+        if keys:
+            try:
+                with st.spinner("AI is building your plan..."):
+                    stats = core.stats_payload(df, core.ml_forecast(df), a, core.dropoff_risk(df))
+                    plan, model = core.llm_plan(days, stats, lang, keys)
+                label = f"AI-generated plan ({model})"
+            except Exception as e:
+                S["plan_msg"] = f"AI unavailable ({type(e).__name__}). Used the rule-based plan instead."
+        else:
+            S["plan_msg"] = "No AI API key set. Used the rule-based plan instead."
+        if plan is None:
+            plan, label = core.build_plan(days, a["recs"])
+        core.save_plan(pid, days, plan, label)
+        st.rerun()
+    if c2.button("Rule-based plan", use_container_width=True):
         plan, label = core.build_plan(days, a["recs"])
         core.save_plan(pid, days, plan, label)
         st.rerun()
+    if "plan_msg" in S:
+        st.warning(S.pop("plan_msg"))
     saved = core.get_plan(pid, days)
     if not saved:
-        st.info("No plan yet. Click the button above.")
+        st.info("No plan yet. Click a button above (regenerating resets progress).")
         return
     plan, label = saved
     done = core.get_done(pid, days)
@@ -443,22 +491,20 @@ def page_reminders():
 def page_about():
     hero("About & responsible use", "How NeuroRevive AI works and what it can't do.")
     st.markdown("""
-**The problem.** Educators worry that students struggle with attention, memory and concentration.
-NeuroRevive AI explores whether short, repeatable tasks and personalised practice help people
-understand their own task performance and build a practice habit.
+**The problem.** Many people, students and busy adults alike, have no simple way to practise attention and memory skills or to notice when their practice habits slip. NeuroRevive AI offers short practice tasks, uses machine learning to forecast task-performance trends, warns when practice is dropping off, and builds a personal 7/14-day wellness routine in English or Urdu. It is a self-monitoring practice tool, not a screening or diagnostic tool.
 
 **The tasks**
 - **Memory Matrix:** score = % of digits recalled in the correct position.
 - **Focus Finder:** score = F1 of ticked vs true targets (penalises misses and wrong picks). Time is shown separately.
 - **Reaction Rush:** score = 100 − (mean ms − 250)/6 − 8 per false start. Five rounds, random 1.5–4 s waits.
 
-**How recommendations work.** A rule-based engine looks at your last three attempts per task: average ≥ 85 → try the next difficulty; < 55 → step down; otherwise stay. Very variable reaction times → extra rounds in consistent conditions. Fewer than 2 attempts → initial assessment (starter plan). An optional language model may reword these findings; it only sees aggregate numbers.
+**Where the AI is.** (1) A scikit-learn regression model is trained on your own attempt history to forecast your next score and trend (needs 4+ attempts). (2) A large language model writes your coaching and your 7/14-day plan in English or Urdu; it only receives aggregate numbers, never your ID. (3) If the language model is unavailable, the app falls back to the ML forecast and a transparent rule engine, which looks at your last three attempts per task: average ≥ 85 → try the next difficulty; < 55 → step down; otherwise stay.
 
 **Data stored.** A nickname you choose, task scores, difficulty, timestamps, plan progress and preferred practice time. No real names, emails or health information.
 
 **Limitations.** Reaction timing includes network delay. Short games are noisy, practice effects inflate early gains, and results depend on device, sleep, and mood. Prototype storage may reset when the demo app restarts.
 
-**Not a diagnosis.** This is not a medical device. It cannot diagnose any condition or say anything about intelligence or brain health. If you are concerned about attention or memory, talk to a qualified professional.
+**Not a diagnosis.** This is not a medical device. It cannot diagnose or screen for any condition or say anything about intelligence or brain health. If you are concerned about attention or memory, talk to a qualified professional.
 """)
 
 
