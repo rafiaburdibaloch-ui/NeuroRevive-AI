@@ -1,299 +1,124 @@
-"""Scoring, recommendations, plans and calendar helpers. No Streamlit code here."""
-from __future__ import annotations
-
-import random
-import statistics
-import uuid
-from datetime import date, datetime, timedelta, timezone
-
-import pandas as pd
-
-DIFFICULTIES = ["easy", "medium", "hard"]
-TASKS = {"memory": "Memory Matrix", "focus": "Focus Finder", "reaction": "Reaction Rush"}
-REACTION_ROUNDS = 5
-
-MEMORY_CONFIG = {
-    "easy": {"size": 3, "cells": 4, "show": 3.0},
-    "medium": {"size": 4, "cells": 6, "show": 3.0},
-    "hard": {"size": 5, "cells": 8, "show": 2.5},
-}
-FOCUS_CONFIG = {
-    "easy": {"size": 6, "targets": 6, "target": "Q", "distractors": "O"},
-    "medium": {"size": 8, "targets": 8, "target": "E", "distractors": "F"},
-    "hard": {"size": 10, "targets": 10, "target": "p", "distractors": "qbd"},
-}
-PURPOSE = {
-    "memory": "Practises holding a short-lived spatial pattern in mind and reproducing it.",
-    "focus": "Practises sustained visual attention and ignoring similar-looking distractors.",
-    "reaction": "Practises responding steadily to a cue while resisting the urge to click early.",
-}
-NO_DATA_RULES = ("R1-no-data", "R2-few-data")
 
 
-# ---------------------------------------------------------------- task generation
-def generate_memory(difficulty: str, seed: int) -> set:
-    cfg = MEMORY_CONFIG[difficulty]
-    rng = random.Random(seed)
-    return set(rng.sample(range(cfg["size"] ** 2), cfg["cells"]))
+# ======================= AI LAYER (ML model + free LLM) =======================
+import re
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
 
 
-def generate_focus(difficulty: str, seed: int):
-    cfg = FOCUS_CONFIG[difficulty]
-    rng = random.Random(seed)
-    total = cfg["size"] ** 2
-    target_idx = set(rng.sample(range(total), cfg["targets"]))
-    grid = [
-        cfg["target"] if i in target_idx else rng.choice(cfg["distractors"])
-        for i in range(total)
-    ]
-    return grid, target_idx
-
-
-# ---------------------------------------------------------------- scoring
-def score_selection(correct: set, selected: set) -> dict:
-    """Accuracy = share of targets found. Score also subtracts false alarms."""
-    n = len(correct)
-    hits = len(correct & selected)
-    false_pos = len(selected - correct)
-    misses = len(correct - selected)
-    accuracy = 100.0 * hits / n if n else 0.0
-    score = 100.0 * max(0, hits - false_pos) / n if n else 0.0
-    return {
-        "hits": hits, "false_positives": false_pos, "misses": misses, "targets": n,
-        "accuracy": round(accuracy, 1), "score": round(score, 1),
-    }
-
-
-def score_reaction(rts: list, false_starts: int) -> dict:
-    """Score maps median reaction time (1200 ms -> 0, 300 ms -> 100), minus 10 per false start."""
-    accuracy = round(100.0 * len(rts) / REACTION_ROUNDS, 1)
-    if not rts:
-        return {"median_ms": None, "mean_ms": None, "best_ms": None, "score": 0.0, "accuracy": accuracy}
-    median = statistics.median(rts)
-    raw = (1200 - median) / 900 * 100 - 10 * false_starts
-    return {
-        "median_ms": round(median), "mean_ms": round(statistics.mean(rts)),
-        "best_ms": min(rts), "score": round(max(0.0, min(100.0, raw)), 1), "accuracy": accuracy,
-    }
-
-
-# ---------------------------------------------------------------- history helpers
-def task_rows(df: pd.DataFrame, task: str) -> pd.DataFrame:
-    if df.empty:
-        return df.iloc[0:0]
-    return df[df["task"] == task].sort_values(["created_at", "id"])
-
-
-def summarize_tasks(df: pd.DataFrame) -> pd.DataFrame:
-    out = []
-    for key, name in TASKS.items():
-        r = task_rows(df, key)
-        if r.empty:
-            out.append({"Task": name, "Attempts": 0, "Latest score": None, "Average score": None,
-                        "Average accuracy (%)": None, "Last difficulty": "-"})
-        else:
-            out.append({
-                "Task": name, "Attempts": int(len(r)),
-                "Latest score": round(float(r.iloc[-1]["score"]), 1),
-                "Average score": round(float(r["score"].mean()), 1),
-                "Average accuracy (%)": round(float(r["accuracy"].astype(float).mean()), 1),
-                "Last difficulty": str(r.iloc[-1]["difficulty"]).title(),
-            })
-    return pd.DataFrame(out)
-
-
-def practice_streak(days: set, today: date) -> int:
-    cur = today if today in days else today - timedelta(days=1)
-    streak = 0
-    while cur in days:
-        streak += 1
-        cur -= timedelta(days=1)
-    return streak
-
-
-def baseline_difficulties(df: pd.DataFrame) -> dict:
+def ml_forecast(df):
+    """scikit-learn LinearRegression trained on the user's own attempt history, per task.
+    Predicts the next score and classifies the trend. Needs 4+ attempts."""
+    import numpy as np
+    from sklearn.linear_model import LinearRegression
     out = {}
-    for key in TASKS:
-        r = task_rows(df, key)
-        if not r.empty:
-            out[key] = str(r.iloc[0]["difficulty"])
+    for task in TASKS:
+        d = df[df["task"] == task].sort_values("created")
+        n = len(d)
+        if n < 4:
+            out[task] = {"n": n, "ready": False}
+            continue
+        X, y = np.arange(n).reshape(-1, 1), d["score"].values
+        m = LinearRegression().fit(X, y)
+        slope = float(m.coef_[0])
+        out[task] = {"n": n, "ready": True,
+                     "next_pred": round(float(np.clip(m.predict([[n]])[0], 0, 100)), 1),
+                     "slope": round(slope, 2), "r2": round(float(m.score(X, y)), 2),
+                     "trend": "improving" if slope > 1 else "declining" if slope < -1 else "flat"}
     return out
 
 
-def compare_latest(rows: pd.DataFrame):
-    """Latest attempt vs the previous one at the SAME difficulty (like-for-like)."""
-    if len(rows) < 2:
+def dropoff_risk(df):
+    """Early warning that practice is dropping off (days since last session)."""
+    if df.empty:
         return None
-    latest = rows.iloc[-1]
-    same = rows[rows["difficulty"] == latest["difficulty"]]
-    if len(same) < 2:
-        return None
-    return same.iloc[-2], same.iloc[-1]
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    days = (now - df["created"].max()).days
+    return {"days_since_last_practice": days,
+            "sessions_last_14_days": int((df["created"] >= now - dt.timedelta(days=14)).sum()),
+            "level": "high" if days >= 5 else "medium" if days >= 3 else "low"}
 
 
-# ---------------------------------------------------------------- recommendations
-def next_difficulty(current: str, recent_acc: list) -> str:
-    idx = DIFFICULTIES.index(current)
-    if len(recent_acc) >= 2:
-        avg = statistics.mean(recent_acc[-2:])
-        if avg >= 85 and idx < len(DIFFICULTIES) - 1:
-            idx += 1
-        elif avg < 50 and idx > 0:
-            idx -= 1
-    return DIFFICULTIES[idx]
+def stats_payload(df, fc, a, risk):
+    """Aggregates only. No participant ID is ever sent to the LLM."""
+    tasks = {}
+    for t in TASKS:
+        d = df[df["task"] == t]
+        tasks[t] = {"attempts": len(d),
+                    "avg_score": round(float(d["score"].mean()), 1) if len(d) else None,
+                    "latest_difficulty": str(d["difficulty"].iloc[-1]) if len(d) else None,
+                    "ml_forecast": fc.get(t),
+                    "rule_recommendation": next(({"difficulty": r["difficulty"], "action": r["action"]}
+                                                 for r in a["recs"] if r["task"] == t), None)}
+    return {"tasks": tasks, "practice_dropoff_risk": risk}
 
 
-def _rec(task, difficulty, headline, detail, rule):
-    return {"task": task, "difficulty": difficulty, "headline": headline, "detail": detail, "rule": rule}
+def llm_json(system, user, api_key):
+    """Calls Groq (free tier), trying several models. Returns (parsed_json, model_name)."""
+    import requests
+    last = None
+    for model in GROQ_MODELS:
+        try:
+            r = requests.post(GROQ_URL, timeout=40,
+                              headers={"Authorization": f"Bearer {api_key}",
+                                       "Content-Type": "application/json"},
+                              json={"model": model, "temperature": 0.3,
+                                    "messages": [{"role": "system", "content": system},
+                                                 {"role": "user", "content": user}]})
+            r.raise_for_status()
+            txt = r.json()["choices"][0]["message"]["content"]
+            return json.loads(re.search(r"\{.*\}", txt, re.S).group(0)), model
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"All models failed: {last}")
 
 
-def recommend_task(df: pd.DataFrame, task: str) -> dict:
-    """Transparent, interpretable rules. Rule IDs are shown to the user."""
-    name = TASKS[task]
-    rows = task_rows(df, task)
-    n = len(rows)
-    default_diff = "standard" if task == "reaction" else "easy"
-
-    if n == 0:
-        return _rec(task, default_diff, f"Complete an initial {name} assessment",
-                    "There are no results yet, so nothing can be personalised. Start with one attempt.",
-                    "R1-no-data")
-    last_diff = str(rows.iloc[-1]["difficulty"])
-    if n == 1:
-        return _rec(task, last_diff, f"Do a second {name} attempt",
-                    "One result is not enough to see a pattern. Repeat at the same level.",
-                    "R2-few-data")
-
-    if task == "reaction":
-        recent = rows.tail(3)
-        avg_fs = statistics.mean(
-            [float(d.get("false_starts", 0)) for d in recent["details_obj"]])
-        all_rts = [x for d in recent["details_obj"] for x in d.get("rts", [])]
-        cv = (statistics.pstdev(all_rts) / statistics.mean(all_rts)) if len(all_rts) >= 6 else None
-        if avg_fs >= 2:
-            return _rec(task, "standard", "Slow down and wait for the cue",
-                        f"You averaged {avg_fs:.1f} false starts per session. Focus on waiting for the "
-                        "green cue before clicking.", "R6-false-starts")
-        if cv is not None and cv > 0.25:
-            return _rec(task, "standard", "Add rounds under consistent conditions",
-                        "Your reaction times vary quite a lot between rounds. This is common and may reflect "
-                        "device, connection or distraction. Try the same device, a quiet space and a few "
-                        "extra sessions before reading anything into it.", "R7-variability")
-        return _rec(task, "standard", "Keep a steady routine",
-                    "Reaction times and false starts look fairly consistent. Keep practising under the "
-                    "same conditions so results stay comparable.", "R8-steady")
-
-    recent_acc = rows[rows["difficulty"] == last_diff]["accuracy"].astype(float).tail(3).tolist()
-    new = next_difficulty(last_diff, recent_acc)
-    if DIFFICULTIES.index(new) > DIFFICULTIES.index(last_diff):
-        return _rec(task, new, f"Try {name} on {new.title()}",
-                    f"Your last attempts at {last_diff.title()} averaged "
-                    f"{statistics.mean(recent_acc[-2:]):.0f}% accuracy, so a modest step up may suit you.",
-                    "R3-step-up")
-    if DIFFICULTIES.index(new) < DIFFICULTIES.index(last_diff):
-        return _rec(task, new, f"Ease back to {new.title()} for {name}",
-                    f"Your last attempts at {last_diff.title()} averaged "
-                    f"{statistics.mean(recent_acc[-2:]):.0f}% accuracy. An easier version lets you build "
-                    "consistency before moving up.", "R4-step-down")
-    return _rec(task, last_diff, f"Keep practising {name} on {last_diff.title()}",
-                "Recent accuracy is in a middle range, or there are not yet two attempts at this level. "
-                "Repeating builds a like-for-like history.", "R5-hold")
+SAFETY = ("You are a supportive practice coach inside a student prototype. Use ONLY the data given. "
+          "Never diagnose, never comment on intelligence or brain health, remind that short games "
+          "are noisy. Return ONLY valid JSON, no markdown.")
 
 
-def pick_next_task(df: pd.DataFrame):
-    """Untried tasks first; otherwise the task practised least recently (balanced practice)."""
-    for key, name in TASKS.items():
-        if task_rows(df, key).empty:
-            return key, f"You haven't tried {name} yet."
-    last = {key: task_rows(df, key)["created_at"].max() for key in TASKS}
-    key = min(last, key=last.get)
-    return key, "It has been the longest since you practised this one, which keeps practice balanced."
+def llm_coach(stats, lang, key):
+    user = (f"Write in {lang}. Data: {json.dumps(stats)}\n"
+            'Return JSON: {"summary": "2-3 sentences", "tips": ["tip1","tip2","tip3"]}')
+    data, model = llm_json(SAFETY, user, key)
+    if not isinstance(data.get("summary"), str) or not isinstance(data.get("tips"), list):
+        raise ValueError("bad coach JSON")
+    return data, model
 
 
-def is_personalised(recs: dict) -> bool:
-    return all(r["rule"] not in NO_DATA_RULES for r in recs.values())
-
-
-def llm_payload(df: pd.DataFrame, recs: dict) -> str:
-    """Aggregated numbers only. No participant ID or other identifying information."""
-    lines = ["Aggregated task-practice statistics:"]
-    for _, r in summarize_tasks(df).iterrows():
-        lines.append(f"- {r['Task']}: attempts={r['Attempts']}, latest score={r['Latest score']}, "
-                     f"average score={r['Average score']}, average accuracy={r['Average accuracy (%)']}, "
-                     f"last difficulty={r['Last difficulty']}")
-    lines.append("Rule-based recommendations already computed:")
-    for key, rec in recs.items():
-        lines.append(f"- {TASKS[key]}: next difficulty={rec['difficulty']} [{rec['rule']}] {rec['headline']}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------- training plans
-def build_plan(length: int, recs: dict, baseline: dict, personalised: bool) -> dict:
-    order = list(TASKS)
-    days = []
-    for d in range(1, length + 1):
-        reassess = d == length
-        picks = order if reassess else [order[(d - 1) % 3], order[d % 3]]
+def validate_plan(plan, days):
+    """Never trust LLM output: check structure, task names and difficulty before saving."""
+    if not isinstance(plan, list) or len(plan) != days:
+        raise ValueError("wrong number of days")
+    clean = []
+    for i, d in enumerate(plan, start=1):
         items = []
-        for i, task in enumerate(picks):
-            diff = baseline.get(task, recs[task]["difficulty"]) if reassess else recs[task]["difficulty"]
-            purpose = PURPOSE[task]
-            if reassess:
-                purpose = ("Reassessment: repeat at the level you first used so the comparison is "
-                           "like-for-like. " + purpose)
-            items.append({"id": f"{d}-{i}", "task": task, "difficulty": diff,
-                          "minutes": 3 if task == "reaction" else 5, "purpose": purpose})
-        days.append({"day": d, "title": "Reassessment day" if reassess else "Practice day", "items": items})
-    return {"label": "Personalised plan" if personalised else "Starter plan",
-            "length": length, "days": days, "done": []}
+        for it in d.get("items", [])[:3]:
+            t = str(it.get("task", "")).lower()
+            if t not in TASKS:
+                raise ValueError("bad task")
+            diff = "standard" if t == "reaction" else str(it.get("difficulty", "")).lower()
+            if t != "reaction" and diff not in LEVELS:
+                raise ValueError("bad difficulty")
+            mins = max(2, min(10, int(it.get("minutes", 5))))
+            items.append({"task": t, "difficulty": diff, "minutes": mins,
+                          "purpose": str(it.get("purpose", PURPOSE[t]))[:180]})
+        if not items:
+            raise ValueError("empty day")
+        clean.append({"day": i, "items": items})
+    return clean
 
 
-def next_plan_item(plan: dict):
-    done = set(plan.get("done", []))
-    for day in plan["days"]:
-        for item in day["items"]:
-            if item["id"] not in done:
-                return day["day"], item
-    return None
-
-
-# ---------------------------------------------------------------- calendar reminder
-def make_ics(hhmm: str, days: int, now: datetime | None = None) -> str:
-    now = now or datetime.now()
-    hour, minute = (int(x) for x in hhmm.split(":"))
-    start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    end = start + timedelta(minutes=15)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    lines = [
-        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//NeuroRevive AI//Practice reminder//EN",
-        "BEGIN:VEVENT", f"UID:{uuid.uuid4()}@neurorevive", f"DTSTAMP:{stamp}",
-        f"DTSTART:{start:%Y%m%dT%H%M%S}", f"DTEND:{end:%Y%m%dT%H%M%S}",
-        f"RRULE:FREQ=DAILY;COUNT={int(days)}",
-        "SUMMARY:NeuroRevive practice session",
-        "DESCRIPTION:Short cognitive task practice (prototype - not a medical tool).",
-        "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Time for your practice session",
-        "TRIGGER:-PT0M", "END:VALARM", "END:VEVENT", "END:VCALENDAR",
-    ]
-    return "\r\n".join(lines) + "\r\n"
-
-
-# ---------------------------------------------------------------- sample data (always labelled)
-def sample_rows(now: datetime | None = None, seed: int = 7) -> list:
-    rng = random.Random(seed)
-    now = now or datetime.now(timezone.utc)
-    rows = []
-    for k in range(6):
-        ts = (now - timedelta(days=5 - k)).isoformat(timespec="seconds")
-        for task in ("memory", "focus"):
-            base = 45 if task == "memory" else 60
-            acc = float(min(100, max(0, base + k * 5 + rng.randint(-6, 6))))
-            rows.append(dict(task=task, difficulty="medium", score=acc, accuracy=acc,
-                             duration_s=float(rng.randint(15, 40)), details={"sample": True}, created_at=ts))
-        fs = rng.choice([0, 0, 1])
-        rts = [rng.randint(340, 520) - k * 6 for _ in range(REACTION_ROUNDS - fs)]
-        res = score_reaction(rts, fs)
-        rows.append(dict(task="reaction", difficulty="standard", score=res["score"], accuracy=res["accuracy"],
-                         duration_s=None, created_at=ts,
-                         details={"rts": rts, "false_starts": fs, "rounds": REACTION_ROUNDS,
-                                  "median_ms": res["median_ms"], "sample": True}))
-    return rows
+def llm_plan(days, stats, lang, key):
+    user = (f"Write the 'purpose' text in {lang} (max 15 words each). Data: {json.dumps(stats)}\n"
+            f"Create a {days}-day practice plan, 1-3 items per day, 3-8 minutes each. Tasks: memory, "
+            "focus, reaction. Difficulty: easy/medium/hard (reaction is always 'standard'). Follow each "
+            "task's rule_recommendation difficulty; if ml_forecast is flat, vary the exercises; if "
+            "dropoff risk is medium/high, make early days shorter. The final day must reassess all "
+            "three tasks at the same difficulty.\n"
+            'Return JSON: {"plan":[{"day":1,"items":[{"task":"memory","difficulty":"easy",'
+            '"minutes":5,"purpose":"..."}]}]}')
+    data, model = llm_json(SAFETY, user, key)
+    return validate_plan(data.get("plan"), days), model
