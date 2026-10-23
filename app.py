@@ -206,6 +206,21 @@ def page_analysis(pid, df):
         st.info("Some tasks have fewer than two attempts, so recommendations there are limited. "
                 "Complete the suggested initial assessments before relying on a personalised plan.")
 
+    st.subheader("ML forecast (scikit-learn)")
+    fcols = st.columns(3)
+    for col, (key, name) in zip(fcols, logic.TASKS.items()):
+        f = logic.ml_forecast(df, key)
+        if f["ready"]:
+            col.metric(name, f"{f['next_pred']:.0f} predicted next",
+                       f"{f['trend']} ({f['slope']:+.1f} per attempt)", delta_color="off")
+            col.caption(f"Linear regression on your last {f['n']} attempts at "
+                        f"{f['difficulty'].title()}. R² = {f['r2']}")
+        else:
+            col.metric(name, "—", f"needs 4+ attempts at one level ({f['n']} so far)",
+                       delta_color="off")
+    st.caption("This model learns only from your own few results, so treat the forecast as a rough "
+               "practice trend. It is not a prediction about ability or health.")
+
     st.subheader("Recommendations")
     for k, rec in recs.items():
         st.markdown(
@@ -218,7 +233,7 @@ def page_analysis(pid, df):
     api_key = get_secret("ANTHROPIC_API_KEY")
     if not api_key:
         st.info("No API key is configured, so the recommendations above come from transparent rules only. "
-                "No AI model was called.")
+                "No language model was called.")
     else:
         st.caption("Only the aggregated numbers above are sent to the model. No participant ID is included.")
         if st.button("Generate AI explanation", key="ai_btn"):
@@ -416,6 +431,14 @@ def page_about():
             "Completion time is recorded but **not** part of the score. Each grid has a seed, so it can be reproduced.\n"
             "- **Reaction Rush:** 5 rounds. Score maps median reaction time (1200 ms → 0, 300 ms → 100) minus 10 per "
             "false start. Timing runs through the server and includes network delay.")
+    with st.expander("Where the AI is"):
+        st.markdown(
+            "1. **Machine learning:** a scikit-learn linear regression is trained on your own score history "
+            "(attempts at your latest difficulty, minimum 4) to forecast your next score and trend. "
+            "It is trained per user, not pre-trained.\n"
+            "2. **Rule engine:** transparent rules choose the next difficulty (below).\n"
+            "3. **Optional language model:** if an API key is configured, a model explains the numbers in plain "
+            "words. It only receives aggregated statistics.")
     with st.expander("How recommendations are generated"):
         st.markdown(
             "Interpretable rules (their IDs are shown next to each recommendation):\n"
@@ -424,9 +447,7 @@ def page_about():
             "- **R4:** the last two attempts averaged < 50% → suggest one level down.\n"
             "- **R5:** otherwise repeat the level.\n"
             "- **R6–R8 (reaction):** many false starts → slow down; high variability → more rounds under "
-            "consistent conditions; otherwise keep a steady routine.\n\n"
-            "If an API key is configured, an optional language model may *explain* those numbers in plain words. "
-            "It only receives aggregated statistics and is told not to make medical claims.")
+            "consistent conditions; otherwise keep a steady routine.")
     with st.expander("What data is stored"):
         st.write("An anonymous participant ID, task name, difficulty, score, accuracy, timings, your training plan, "
                  "and your preferred reminder time. No names, emails or other personal details are requested. "
