@@ -511,7 +511,8 @@ def _generate(system, user, keys, validate):
                 result = validate(_extract_json(fn(model, key, system, user)))
                 return result, f"{name}:{model}"
             except Exception as exc:  # try the next model / provider; never leak the key
-                errors.append(f"{name}:{model}:{type(exc).__name__}")
+                code = getattr(getattr(exc, "response", None), "status_code", "")
+                errors.append(f"{name}:{model}:{type(exc).__name__}{code}")
     raise RuntimeError("all providers failed: " + ", ".join(errors))
 
 
