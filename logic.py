@@ -227,6 +227,31 @@ def llm_payload(df: pd.DataFrame, recs: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- ML forecast
+def ml_forecast(df: pd.DataFrame, task: str) -> dict:
+    """Linear regression on score vs attempt number, using only attempts at the latest difficulty."""
+    rows = task_rows(df, task)
+    if rows.empty:
+        return {"ready": False, "n": 0, "difficulty": "-"}
+    diff = str(rows.iloc[-1]["difficulty"])
+    same = rows[rows["difficulty"] == diff].tail(10)
+    n = len(same)
+    if n < 4:
+        return {"ready": False, "n": n, "difficulty": diff}
+
+    import numpy as np
+    from sklearn.linear_model import LinearRegression
+
+    X = np.arange(n).reshape(-1, 1)
+    y = same["score"].astype(float).to_numpy()
+    model = LinearRegression().fit(X, y)
+    slope = float(model.coef_[0])
+    pred = float(min(100.0, max(0.0, model.predict([[n]])[0])))
+    trend = "rising" if slope > 2 else "falling" if slope < -2 else "flat"
+    return {"ready": True, "n": n, "difficulty": diff, "next_pred": pred,
+            "slope": slope, "r2": round(float(model.score(X, y)), 2), "trend": trend}
+
+
 # ---------------------------------------------------------------- training plans
 def build_plan(length: int, recs: dict, baseline: dict, personalised: bool) -> dict:
     order = list(TASKS)
