@@ -1,0 +1,22 @@
+[data-testid="stAppViewContainer"]{background:radial-gradient(1200px 600px at 10% -10%,#1B2559 0%,#0A1030 55%,#070B22 100%);}
+[data-testid="stHeader"]{background:transparent;}
+[data-testid="stSidebar"]{background:#0B1233;border-right:1px solid #26325F;}
+h1,h2,h3,h4{letter-spacing:-0.02em;}
+.hero{background:linear-gradient(135deg,rgba(99,102,241,.25),rgba(34,211,238,.12));border:1px solid #26325F;border-radius:20px;padding:1.4rem 1.8rem;margin-bottom:1rem;}
+.hero h1{margin:0 0 .3rem;font-size:2.2rem;background:linear-gradient(90deg,#C4B5FD,#67E8F9);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.hero p{color:#9AA6D1;margin:0;max-width:760px;}
+.card{background:#111B3A;border:1px solid #26325F;border-radius:16px;padding:1rem 1.25rem;margin-bottom:.8rem;}
+.card h4{margin:0 0 .4rem;}
+.card p{margin:0;color:#C9D1F0;}
+.badge{display:inline-block;padding:.12rem .65rem;margin-right:.5rem;border-radius:999px;font-size:.75rem;color:#22D3EE;border:1px solid #26325F;background:rgba(34,211,238,.08);}
+.badge.violet{color:#C4B5FD;background:rgba(139,92,246,.12);}
+.badge.amber{color:#FBBF24;background:rgba(251,191,36,.08);}
+.disclaimer{margin:1.2rem 0 .5rem;padding:.7rem 1rem;border-radius:12px;border:1px solid #26325F;background:rgba(251,191,36,.06);color:#E6E9F5;font-size:.85rem;}
+.stimulus{font-size:3rem;font-weight:700;letter-spacing:.4em;text-align:center;padding:2rem 1rem;margin:1rem 0;border-radius:18px;background:#111B3A;border:1px solid #26325F;color:#67E8F9;}
+.rx-box{height:180px;border-radius:18px;display:flex;align-items:center;justify-content:center;font-size:1.6rem;font-weight:700;margin-bottom:.6rem;}
+.rx-idle{background:#111B3A;color:#C9D1F0;border:2px solid #26325F;}
+.rx-wait{background:#78350F;color:#FDE68A;border:2px solid #FBBF24;}
+.rx-go{background:#065F46;color:#D1FAE5;border:2px solid #34D399;}
+[data-testid="stMetric"]{background:#111B3A;border:1px solid #26325F;border-radius:14px;padding:.8rem 1rem;}
+.stButton>button{border-radius:12px;}
+:focus-visible{outline:3px solid #22D3EE !important;outline-offset:2px;}
