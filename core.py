@@ -1,323 +1,299 @@
-"""core.py - data storage, scoring, recommendation engine, plans, calendar.
-No Streamlit imports here, so everything can be unit-tested."""
-import datetime as dt
-import json
+"""Scoring, recommendations, plans and calendar helpers. No Streamlit code here."""
+from __future__ import annotations
+
 import random
-import sqlite3
 import statistics
 import uuid
-from pathlib import Path
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
-DB_PATH = Path(__file__).with_name("neurorevive.db")
-LEVELS = ["easy", "medium", "hard"]
+DIFFICULTIES = ["easy", "medium", "hard"]
 TASKS = {"memory": "Memory Matrix", "focus": "Focus Finder", "reaction": "Reaction Rush"}
+REACTION_ROUNDS = 5
+
+MEMORY_CONFIG = {
+    "easy": {"size": 3, "cells": 4, "show": 3.0},
+    "medium": {"size": 4, "cells": 6, "show": 3.0},
+    "hard": {"size": 5, "cells": 8, "show": 2.5},
+}
+FOCUS_CONFIG = {
+    "easy": {"size": 6, "targets": 6, "target": "Q", "distractors": "O"},
+    "medium": {"size": 8, "targets": 8, "target": "E", "distractors": "F"},
+    "hard": {"size": 10, "targets": 10, "target": "p", "distractors": "qbd"},
+}
 PURPOSE = {
-    "memory": "Practises holding and reproducing short digit sequences.",
-    "focus": "Practises visual search for a target among similar-looking distractors.",
-    "reaction": "Practises steady, consistent responses to a visual cue.",
+    "memory": "Practises holding a short-lived spatial pattern in mind and reproducing it.",
+    "focus": "Practises sustained visual attention and ignoring similar-looking distractors.",
+    "reaction": "Practises responding steadily to a cue while resisting the urge to click early.",
 }
-# memory: (digits, seconds per digit)
-MEMORY_CFG = {"easy": (4, 1.0), "medium": (6, 0.8), "hard": (8, 0.6)}
-# focus: (rows, cols, number of targets, target, distractors)
-FOCUS_CFG = {
-    "easy": (4, 5, 4, "E", ["X", "M", "O"]),
-    "medium": (5, 6, 7, "E", ["F", "L", "B"]),
-    "hard": (6, 8, 12, "E", ["F", "L", "B", "P"]),
-}
+NO_DATA_RULES = ("R1-no-data", "R2-few-data")
 
 
-# ---------------------------------------------------------------- database
-def _conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with _conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS results(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            attempt TEXT UNIQUE, participant TEXT NOT NULL, task TEXT NOT NULL,
-            difficulty TEXT NOT NULL, score REAL NOT NULL, accuracy REAL,
-            rt_ms REAL, rt_sd REAL, duration_s REAL, created TEXT NOT NULL,
-            sample INTEGER DEFAULT 0)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS plans(
-            participant TEXT, days INTEGER, label TEXT, body TEXT,
-            PRIMARY KEY(participant, days))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS plan_progress(
-            participant TEXT, days INTEGER, day INTEGER, item INTEGER,
-            PRIMARY KEY(participant, days, day, item))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS settings(
-            participant TEXT PRIMARY KEY, practice_time TEXT)""")
-
-
-def _now():
-    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-
-
-def save_result(pid, task, difficulty, score, accuracy=None, rt_ms=None, rt_sd=None,
-                duration_s=None, attempt=None, created=None, sample=0):
-    """INSERT OR IGNORE on a unique attempt id => one submission can never be saved twice."""
-    attempt = attempt or uuid.uuid4().hex
-    with _conn() as c:
-        cur = c.execute(
-            "INSERT OR IGNORE INTO results(attempt,participant,task,difficulty,score,accuracy,"
-            "rt_ms,rt_sd,duration_s,created,sample) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (attempt, pid, task, difficulty, float(score), accuracy, rt_ms, rt_sd,
-             duration_s, created or _now(), sample))
-        return cur.rowcount == 1
-
-
-COLUMNS = ["id", "attempt", "participant", "task", "difficulty", "score", "accuracy",
-           "rt_ms", "rt_sd", "duration_s", "created", "sample"]
-
-
-def get_results(pid):
-    with _conn() as c:
-        rows = c.execute("SELECT * FROM results WHERE participant=? ORDER BY created, id",
-                         (pid,)).fetchall()
-    df = pd.DataFrame([dict(r) for r in rows], columns=COLUMNS)
-    df["created"] = pd.to_datetime(df["created"])
-    df["task_name"] = df["task"].map(TASKS)
-    return df
-
-
-def delete_sample(pid):
-    with _conn() as c:
-        c.execute("DELETE FROM results WHERE participant=? AND sample=1", (pid,))
-
-
-def generate_sample(pid):
-    """Clearly-labelled demo data (sample=1) so the dashboard is not empty on stage."""
-    rng = random.Random(42)
-    base = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-    plan = [("memory", "easy", 70), ("focus", "easy", 72), ("reaction", "standard", 68),
-            ("memory", "easy", 80), ("focus", "easy", 85), ("reaction", "standard", 72),
-            ("memory", "medium", 62), ("focus", "medium", 74), ("reaction", "standard", 76)]
-    for i, (task, level, score) in enumerate(plan):
-        when = (base - dt.timedelta(days=len(plan) - i)).isoformat(timespec="seconds")
-        score = min(100, score + rng.randint(-3, 3))
-        rt = rng.randint(380, 520) if task == "reaction" else None
-        save_result(pid, task, level, score, accuracy=round(score / 100, 2), rt_ms=rt,
-                    rt_sd=(rt * 0.2 if rt else None), duration_s=rng.randint(15, 60),
-                    created=when, sample=1)
-
-
-# ----------------------------------------------------------------- scoring
-def generate_sequence(level, seed):
-    n, _ = MEMORY_CFG[level]
+# ---------------------------------------------------------------- task generation
+def generate_memory(difficulty: str, seed: int) -> set:
+    cfg = MEMORY_CONFIG[difficulty]
     rng = random.Random(seed)
-    return "".join(str(rng.randint(0, 9)) for _ in range(n))
+    return set(rng.sample(range(cfg["size"] ** 2), cfg["cells"]))
 
 
-def score_memory(target, answer):
-    """Position-by-position match. Score 0-100 = % of digits in the correct place."""
-    digits = "".join(ch for ch in answer if ch.isdigit())
-    correct = sum(1 for a, b in zip(target, digits) if a == b)
-    return {"score": round(100 * correct / len(target), 1), "correct": correct, "total": len(target)}
-
-
-def generate_grid(level, seed):
-    rows, cols, k, target, distractors = FOCUS_CFG[level]
+def generate_focus(difficulty: str, seed: int):
+    cfg = FOCUS_CONFIG[difficulty]
     rng = random.Random(seed)
-    n = rows * cols
-    targets = set(rng.sample(range(n), k))
-    cells = [target if i in targets else rng.choice(distractors) for i in range(n)]
-    return cells, sorted(targets)
+    total = cfg["size"] ** 2
+    target_idx = set(rng.sample(range(total), cfg["targets"]))
+    grid = [
+        cfg["target"] if i in target_idx else rng.choice(cfg["distractors"])
+        for i in range(total)
+    ]
+    return grid, target_idx
 
 
-def score_focus(targets, picked):
-    """F1 of picked cells vs true targets (penalises both misses and false picks).
-    Time is reported separately and does NOT affect the score."""
-    t, p = set(targets), set(picked)
-    tp, fp, fn = len(t & p), len(p - t), len(t - p)
-    precision = tp / (tp + fp) if tp + fp else 0.0
-    recall = tp / len(t) if t else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {"score": round(100 * f1, 1), "accuracy": round(f1, 3), "tp": tp, "fp": fp, "fn": fn}
+# ---------------------------------------------------------------- scoring
+def score_selection(correct: set, selected: set) -> dict:
+    """Accuracy = share of targets found. Score also subtracts false alarms."""
+    n = len(correct)
+    hits = len(correct & selected)
+    false_pos = len(selected - correct)
+    misses = len(correct - selected)
+    accuracy = 100.0 * hits / n if n else 0.0
+    score = 100.0 * max(0, hits - false_pos) / n if n else 0.0
+    return {
+        "hits": hits, "false_positives": false_pos, "misses": misses, "targets": n,
+        "accuracy": round(accuracy, 1), "score": round(score, 1),
+    }
 
 
-def score_reaction(rts, false_starts):
-    """Score = 100 - (mean RT - 250ms)/6 - 8 per false start, clamped 0-100."""
+def score_reaction(rts: list, false_starts: int) -> dict:
+    """Score maps median reaction time (1200 ms -> 0, 300 ms -> 100), minus 10 per false start."""
+    accuracy = round(100.0 * len(rts) / REACTION_ROUNDS, 1)
     if not rts:
-        return {"score": 0.0, "accuracy": 0.0, "mean": None, "sd": None}
-    mean = statistics.fmean(rts)
-    sd = statistics.pstdev(rts) if len(rts) > 1 else 0.0
-    score = max(0.0, min(100.0, 100 - (mean - 250) / 6 - 8 * false_starts))
-    return {"score": round(score, 1), "accuracy": round(len(rts) / (len(rts) + false_starts), 3),
-            "mean": round(mean, 1), "sd": round(sd, 1)}
+        return {"median_ms": None, "mean_ms": None, "best_ms": None, "score": 0.0, "accuracy": accuracy}
+    median = statistics.median(rts)
+    raw = (1200 - median) / 900 * 100 - 10 * false_starts
+    return {
+        "median_ms": round(median), "mean_ms": round(statistics.mean(rts)),
+        "best_ms": min(rts), "score": round(max(0.0, min(100.0, raw)), 1), "accuracy": accuracy,
+    }
 
 
-# ------------------------------------------------------- recommendation engine
-def current_streak(df):
+# ---------------------------------------------------------------- history helpers
+def task_rows(df: pd.DataFrame, task: str) -> pd.DataFrame:
     if df.empty:
-        return 0
-    days = set(df["created"].dt.date)
-    day = dt.datetime.now(dt.timezone.utc).date()
-    if day not in days:
-        day -= dt.timedelta(days=1)
+        return df.iloc[0:0]
+    return df[df["task"] == task].sort_values(["created_at", "id"])
+
+
+def summarize_tasks(df: pd.DataFrame) -> pd.DataFrame:
+    out = []
+    for key, name in TASKS.items():
+        r = task_rows(df, key)
+        if r.empty:
+            out.append({"Task": name, "Attempts": 0, "Latest score": None, "Average score": None,
+                        "Average accuracy (%)": None, "Last difficulty": "-"})
+        else:
+            out.append({
+                "Task": name, "Attempts": int(len(r)),
+                "Latest score": round(float(r.iloc[-1]["score"]), 1),
+                "Average score": round(float(r["score"].mean()), 1),
+                "Average accuracy (%)": round(float(r["accuracy"].astype(float).mean()), 1),
+                "Last difficulty": str(r.iloc[-1]["difficulty"]).title(),
+            })
+    return pd.DataFrame(out)
+
+
+def practice_streak(days: set, today: date) -> int:
+    cur = today if today in days else today - timedelta(days=1)
     streak = 0
-    while day in days:
+    while cur in days:
         streak += 1
-        day -= dt.timedelta(days=1)
+        cur -= timedelta(days=1)
     return streak
 
 
-def analyse(df):
-    """Transparent, testable rules. Returns findings + one recommendation per task."""
-    findings, recs = [], []
-    for task, name in TASKS.items():
-        d = df[df["task"] == task].sort_values("created")
-        n = len(d)
-        std = "standard" if task == "reaction" else "easy"
-        if n < 2:
-            recs.append({"task": task, "difficulty": std, "action": "assess",
-                         "reason": f"Only {n} {name} attempt(s) saved. Complete at least 2 initial "
-                                   f"attempts before personalising."})
-            continue
-        last = d.tail(3)
-        avg = float(last["score"].mean())
-        cur = str(last["difficulty"].iloc[-1])
-        findings.append(f"{name}: {n} attempts, average {d['score'].mean():.0f}, latest "
-                        f"{d['score'].iloc[-1]:.0f} at {cur} level (last-3 average {avg:.0f}).")
-        if task == "reaction":
-            cvs = (last["rt_sd"] / last["rt_ms"]).dropna()
-            cv = float(cvs.mean()) if len(cvs) else 0.0
-            if cv > 0.30:
-                recs.append({"task": task, "difficulty": std, "action": "consistency",
-                             "reason": f"Reaction times varied a lot between rounds (variation "
-                                       f"{cv:.0%} of the mean). Practise in the same quiet setting "
-                                       f"with the same device; extra rounds help stabilise it. "
-                                       f"This is about measurement consistency, not health."})
-            elif last["accuracy"].dropna().mean() < 0.8:
-                recs.append({"task": task, "difficulty": std, "action": "keep",
-                             "reason": "Several false starts. Wait for the green cue before clicking."})
-            else:
-                recs.append({"task": task, "difficulty": std, "action": "keep",
-                             "reason": "Steady results. Keep practising under the same conditions."})
-            continue
-        idx = LEVELS.index(cur) if cur in LEVELS else 0
-        if avg >= 85 and idx < 2:
-            recs.append({"task": task, "difficulty": LEVELS[idx + 1], "action": "up",
-                         "reason": f"Last-3 average {avg:.0f} at {cur}. Try a modest step up to "
-                                   f"{LEVELS[idx + 1]}."})
-        elif avg < 55 and idx > 0:
-            recs.append({"task": task, "difficulty": LEVELS[idx - 1], "action": "down",
-                         "reason": f"Last-3 average {avg:.0f} at {cur}. A shorter/easier version "
-                                   f"({LEVELS[idx - 1]}) lets you build consistency first."})
-        else:
-            recs.append({"task": task, "difficulty": cur, "action": "keep",
-                         "reason": f"Last-3 average {avg:.0f} at {cur}. Stay at this level."})
-    caveat = ("Scores from a few short games can't measure intelligence or brain health, and early "
-              "improvement partly reflects practice effects.")
-    return {"findings": findings, "recs": recs, "caveat": caveat, "source": "Rule-based engine"}
+def baseline_difficulties(df: pd.DataFrame) -> dict:
+    out = {}
+    for key in TASKS:
+        r = task_rows(df, key)
+        if not r.empty:
+            out[key] = str(r.iloc[0]["difficulty"])
+    return out
 
 
-def next_activity(df, recs):
-    for r in recs:
-        if r["action"] == "assess":
-            return r
-    last_seen = {t: df[df["task"] == t]["created"].max() for t in TASKS}
-    oldest = min(last_seen, key=lambda t: last_seen[t])
-    return next(r for r in recs if r["task"] == oldest)
-
-
-def build_plan(days, recs):
-    """Returns (plan, label). Starter plan if we lack data for any task."""
-    by = {r["task"]: r for r in recs}
-    starter = any(r["action"] == "assess" for r in recs)
-    order = list(TASKS)
-
-    def item(t, minutes=5, note=None):
-        return {"task": t, "difficulty": by[t]["difficulty"], "minutes": minutes,
-                "purpose": note or PURPOSE[t]}
-
-    plan = []
-    for d in range(1, days + 1):
-        if d in (7, days):
-            items = [item(t, 4, "Reassessment: repeat at the same difficulty to compare like with like.")
-                     for t in order]
-        else:
-            items = [item(order[(d - 1) % 3]), item(order[d % 3])]
-        plan.append({"day": d, "items": items})
-    return plan, ("Starter plan" if starter else "Personalised plan")
-
-
-def save_plan(pid, days, plan, label):
-    with _conn() as c:
-        c.execute("REPLACE INTO plans VALUES(?,?,?,?)", (pid, days, label, json.dumps(plan)))
-        c.execute("DELETE FROM plan_progress WHERE participant=? AND days=?", (pid, days))
-
-
-def get_plan(pid, days):
-    with _conn() as c:
-        r = c.execute("SELECT label, body FROM plans WHERE participant=? AND days=?",
-                      (pid, days)).fetchone()
-    return (json.loads(r["body"]), r["label"]) if r else None
-
-
-def set_done(pid, days, day, item, done):
-    with _conn() as c:
-        if done:
-            c.execute("INSERT OR IGNORE INTO plan_progress VALUES(?,?,?,?)", (pid, days, day, item))
-        else:
-            c.execute("DELETE FROM plan_progress WHERE participant=? AND days=? AND day=? AND item=?",
-                      (pid, days, day, item))
-
-
-def get_done(pid, days):
-    with _conn() as c:
-        rows = c.execute("SELECT day, item FROM plan_progress WHERE participant=? AND days=?",
-                         (pid, days)).fetchall()
-    return {(r["day"], r["item"]) for r in rows}
-
-
-def plan_completion(pid, days):
-    saved = get_plan(pid, days)
-    if not saved:
+def compare_latest(rows: pd.DataFrame):
+    """Latest attempt vs the previous one at the SAME difficulty (like-for-like)."""
+    if len(rows) < 2:
         return None
-    total = sum(len(d["items"]) for d in saved[0])
-    return len(get_done(pid, days)), total
+    latest = rows.iloc[-1]
+    same = rows[rows["difficulty"] == latest["difficulty"]]
+    if len(same) < 2:
+        return None
+    return same.iloc[-2], same.iloc[-1]
 
 
-# ---------------------------------------------------------------- reminders
-def get_time(pid):
-    with _conn() as c:
-        r = c.execute("SELECT practice_time FROM settings WHERE participant=?", (pid,)).fetchone()
-    return r["practice_time"] if r else "18:00"
+# ---------------------------------------------------------------- recommendations
+def next_difficulty(current: str, recent_acc: list) -> str:
+    idx = DIFFICULTIES.index(current)
+    if len(recent_acc) >= 2:
+        avg = statistics.mean(recent_acc[-2:])
+        if avg >= 85 and idx < len(DIFFICULTIES) - 1:
+            idx += 1
+        elif avg < 50 and idx > 0:
+            idx -= 1
+    return DIFFICULTIES[idx]
 
 
-def set_time(pid, hhmm):
-    with _conn() as c:
-        c.execute("REPLACE INTO settings VALUES(?,?)", (pid, hhmm))
+def _rec(task, difficulty, headline, detail, rule):
+    return {"task": task, "difficulty": difficulty, "headline": headline, "detail": detail, "rule": rule}
 
 
-def make_ics(hhmm, days, activity):
-    start = (dt.date.today() + dt.timedelta(days=1)).strftime("%Y%m%d")
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    t = hhmm.replace(":", "") + "00"
-    return "\r\n".join([
-        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//NeuroRevive AI//EN", "BEGIN:VEVENT",
-        f"UID:{uuid.uuid4()}@neurorevive", f"DTSTAMP:{stamp}", f"DTSTART:{start}T{t}",
-        "DURATION:PT10M", f"RRULE:FREQ=DAILY;COUNT={days}",
-        "SUMMARY:NeuroRevive practice session", f"DESCRIPTION:Suggested: {activity}",
-        "END:VEVENT", "END:VCALENDAR"])
+def recommend_task(df: pd.DataFrame, task: str) -> dict:
+    """Transparent, interpretable rules. Rule IDs are shown to the user."""
+    name = TASKS[task]
+    rows = task_rows(df, task)
+    n = len(rows)
+    default_diff = "standard" if task == "reaction" else "easy"
+
+    if n == 0:
+        return _rec(task, default_diff, f"Complete an initial {name} assessment",
+                    "There are no results yet, so nothing can be personalised. Start with one attempt.",
+                    "R1-no-data")
+    last_diff = str(rows.iloc[-1]["difficulty"])
+    if n == 1:
+        return _rec(task, last_diff, f"Do a second {name} attempt",
+                    "One result is not enough to see a pattern. Repeat at the same level.",
+                    "R2-few-data")
+
+    if task == "reaction":
+        recent = rows.tail(3)
+        avg_fs = statistics.mean(
+            [float(d.get("false_starts", 0)) for d in recent["details_obj"]])
+        all_rts = [x for d in recent["details_obj"] for x in d.get("rts", [])]
+        cv = (statistics.pstdev(all_rts) / statistics.mean(all_rts)) if len(all_rts) >= 6 else None
+        if avg_fs >= 2:
+            return _rec(task, "standard", "Slow down and wait for the cue",
+                        f"You averaged {avg_fs:.1f} false starts per session. Focus on waiting for the "
+                        "green cue before clicking.", "R6-false-starts")
+        if cv is not None and cv > 0.25:
+            return _rec(task, "standard", "Add rounds under consistent conditions",
+                        "Your reaction times vary quite a lot between rounds. This is common and may reflect "
+                        "device, connection or distraction. Try the same device, a quiet space and a few "
+                        "extra sessions before reading anything into it.", "R7-variability")
+        return _rec(task, "standard", "Keep a steady routine",
+                    "Reaction times and false starts look fairly consistent. Keep practising under the "
+                    "same conditions so results stay comparable.", "R8-steady")
+
+    recent_acc = rows[rows["difficulty"] == last_diff]["accuracy"].astype(float).tail(3).tolist()
+    new = next_difficulty(last_diff, recent_acc)
+    if DIFFICULTIES.index(new) > DIFFICULTIES.index(last_diff):
+        return _rec(task, new, f"Try {name} on {new.title()}",
+                    f"Your last attempts at {last_diff.title()} averaged "
+                    f"{statistics.mean(recent_acc[-2:]):.0f}% accuracy, so a modest step up may suit you.",
+                    "R3-step-up")
+    if DIFFICULTIES.index(new) < DIFFICULTIES.index(last_diff):
+        return _rec(task, new, f"Ease back to {new.title()} for {name}",
+                    f"Your last attempts at {last_diff.title()} averaged "
+                    f"{statistics.mean(recent_acc[-2:]):.0f}% accuracy. An easier version lets you build "
+                    "consistency before moving up.", "R4-step-down")
+    return _rec(task, last_diff, f"Keep practising {name} on {last_diff.title()}",
+                "Recent accuracy is in a middle range, or there are not yet two attempts at this level. "
+                "Repeating builds a like-for-like history.", "R5-hold")
 
 
-# ------------------------------------------------------------ optional LLM
-def llm_explain(summary_text, api_key, model="claude-sonnet-5-5"):
-    """Optional. Sends ONLY aggregate scores (no participant ID). Raises on failure."""
-    import requests
-    prompt = ("You are a supportive practice coach in a student prototype. Using ONLY the data "
-              "below, write 3-4 short, friendly sentences of practice advice. Do not diagnose, "
-              "do not mention intelligence or brain health, and note results are from short games.\n\n"
-              + summary_text)
-    r = requests.post("https://api.anthropic.com/v1/messages", timeout=30,
-                      headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                               "content-type": "application/json"},
-                      json={"model": model, "max_tokens": 300,
-                            "messages": [{"role": "user", "content": prompt}]})
-    r.raise_for_status()
-    return "".join(b.get("text", "") for b in r.json()["content"])
+def pick_next_task(df: pd.DataFrame):
+    """Untried tasks first; otherwise the task practised least recently (balanced practice)."""
+    for key, name in TASKS.items():
+        if task_rows(df, key).empty:
+            return key, f"You haven't tried {name} yet."
+    last = {key: task_rows(df, key)["created_at"].max() for key in TASKS}
+    key = min(last, key=last.get)
+    return key, "It has been the longest since you practised this one, which keeps practice balanced."
+
+
+def is_personalised(recs: dict) -> bool:
+    return all(r["rule"] not in NO_DATA_RULES for r in recs.values())
+
+
+def llm_payload(df: pd.DataFrame, recs: dict) -> str:
+    """Aggregated numbers only. No participant ID or other identifying information."""
+    lines = ["Aggregated task-practice statistics:"]
+    for _, r in summarize_tasks(df).iterrows():
+        lines.append(f"- {r['Task']}: attempts={r['Attempts']}, latest score={r['Latest score']}, "
+                     f"average score={r['Average score']}, average accuracy={r['Average accuracy (%)']}, "
+                     f"last difficulty={r['Last difficulty']}")
+    lines.append("Rule-based recommendations already computed:")
+    for key, rec in recs.items():
+        lines.append(f"- {TASKS[key]}: next difficulty={rec['difficulty']} [{rec['rule']}] {rec['headline']}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- training plans
+def build_plan(length: int, recs: dict, baseline: dict, personalised: bool) -> dict:
+    order = list(TASKS)
+    days = []
+    for d in range(1, length + 1):
+        reassess = d == length
+        picks = order if reassess else [order[(d - 1) % 3], order[d % 3]]
+        items = []
+        for i, task in enumerate(picks):
+            diff = baseline.get(task, recs[task]["difficulty"]) if reassess else recs[task]["difficulty"]
+            purpose = PURPOSE[task]
+            if reassess:
+                purpose = ("Reassessment: repeat at the level you first used so the comparison is "
+                           "like-for-like. " + purpose)
+            items.append({"id": f"{d}-{i}", "task": task, "difficulty": diff,
+                          "minutes": 3 if task == "reaction" else 5, "purpose": purpose})
+        days.append({"day": d, "title": "Reassessment day" if reassess else "Practice day", "items": items})
+    return {"label": "Personalised plan" if personalised else "Starter plan",
+            "length": length, "days": days, "done": []}
+
+
+def next_plan_item(plan: dict):
+    done = set(plan.get("done", []))
+    for day in plan["days"]:
+        for item in day["items"]:
+            if item["id"] not in done:
+                return day["day"], item
+    return None
+
+
+# ---------------------------------------------------------------- calendar reminder
+def make_ics(hhmm: str, days: int, now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    hour, minute = (int(x) for x in hhmm.split(":"))
+    start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    end = start + timedelta(minutes=15)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//NeuroRevive AI//Practice reminder//EN",
+        "BEGIN:VEVENT", f"UID:{uuid.uuid4()}@neurorevive", f"DTSTAMP:{stamp}",
+        f"DTSTART:{start:%Y%m%dT%H%M%S}", f"DTEND:{end:%Y%m%dT%H%M%S}",
+        f"RRULE:FREQ=DAILY;COUNT={int(days)}",
+        "SUMMARY:NeuroRevive practice session",
+        "DESCRIPTION:Short cognitive task practice (prototype - not a medical tool).",
+        "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Time for your practice session",
+        "TRIGGER:-PT0M", "END:VALARM", "END:VEVENT", "END:VCALENDAR",
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+# ---------------------------------------------------------------- sample data (always labelled)
+def sample_rows(now: datetime | None = None, seed: int = 7) -> list:
+    rng = random.Random(seed)
+    now = now or datetime.now(timezone.utc)
+    rows = []
+    for k in range(6):
+        ts = (now - timedelta(days=5 - k)).isoformat(timespec="seconds")
+        for task in ("memory", "focus"):
+            base = 45 if task == "memory" else 60
+            acc = float(min(100, max(0, base + k * 5 + rng.randint(-6, 6))))
+            rows.append(dict(task=task, difficulty="medium", score=acc, accuracy=acc,
+                             duration_s=float(rng.randint(15, 40)), details={"sample": True}, created_at=ts))
+        fs = rng.choice([0, 0, 1])
+        rts = [rng.randint(340, 520) - k * 6 for _ in range(REACTION_ROUNDS - fs)]
+        res = score_reaction(rts, fs)
+        rows.append(dict(task="reaction", difficulty="standard", score=res["score"], accuracy=res["accuracy"],
+                         duration_s=None, created_at=ts,
+                         details={"rts": rts, "false_starts": fs, "rounds": REACTION_ROUNDS,
+                                  "median_ms": res["median_ms"], "sample": True}))
+    return rows
