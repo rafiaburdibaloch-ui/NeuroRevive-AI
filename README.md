@@ -93,8 +93,8 @@ A username (or random guest ID), a salted and hashed password if you create an a
 
 ## Team
 
-Surhan Mehak Memon
-Muzaena Shahid
-Rafia Burdi Baloch - Leader
+- Surhan Mehak Memon
+- Muzaena Shahid
+- Rafia Burdi Baloch - Leader
 
 
